@@ -1,0 +1,23 @@
+[package]
+name = "dragonfly-client-rdma"
+description = "RDMA capability discovery and resource ownership for the dragonfly client"
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+license.workspace = true
+edition.workspace = true
+readme = "README.md"
+
+[features]
+default = []
+rdma = ["dep:cc", "dep:pkg-config"]
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+cc = { workspace = true, optional = true }
+pkg-config = { workspace = true, optional = true }

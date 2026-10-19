@@ -33,6 +33,8 @@ COPY dragonfly-client-backend/examples/plugin/src ./dragonfly-client-backend/exa
 COPY dragonfly-client-metric/Cargo.toml ./dragonfly-client-metric/Cargo.toml
 COPY dragonfly-client-metric/src ./dragonfly-client-metric/src
 
+COPY dragonfly-client-rdma ./dragonfly-client-rdma
+
 
 COPY dragonfly-client-util/Cargo.toml ./dragonfly-client-util/Cargo.toml
 COPY dragonfly-client-util/src ./dragonfly-client-util/src

@@ -8,6 +8,7 @@ members = [
   "dragonfly-client-core",
   "dragonfly-client-init",
   "dragonfly-client-metric",
+  "dragonfly-client-rdma",
   "dragonfly-client-storage",
   "dragonfly-client-util",
 ]
@@ -28,6 +29,7 @@ async-trait = "0.1"
 bytes = "1.11"
 bytesize = { version = "1.3.3", features = ["serde"] }
 bytesize-serde = "0.2.1"
+cc = "1.2"
 cgroups-rs = "0.5"
 chrono = { version = "0.4.45", features = ["clock", "serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
@@ -88,6 +90,7 @@ opendal = { version = "0.55.0", default-features = false, features = [
   "services-webhdfs",
 ] }
 percent-encoding = "2.3.2"
+pkg-config = "0.3"
 prost-wkt-types = "0.7"
 rcgen = { version = "0.12.1", features = ["x509-parser"] }
 regex = "1.12.3"

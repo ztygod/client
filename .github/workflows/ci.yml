@@ -77,6 +77,9 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
+      - name: Install libfabric for RDMA feature tests
+        run: sudo apt-get update && sudo apt-get install -y libfabric-dev pkg-config
+
       - name: Run tests
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
@@ -86,3 +89,32 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           verbose: true
+
+  rdma:
+    name: RDMA discovery and resource ownership
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: clippy
+
+      - name: Install libfabric
+        run: sudo apt-get update && sudo apt-get install -y libfabric-dev pkg-config
+
+      - name: Test feature-disabled behavior
+        run: cargo test --locked -p dragonfly-client-rdma
+
+      - name: Test libfabric discovery and resources without RDMA hardware
+        run: cargo test --locked -p dragonfly-client-rdma --all-features
+
+      - name: Lint Linux FFI
+        run: cargo clippy --locked -p dragonfly-client-rdma --all-targets --all-features -- -D warnings
