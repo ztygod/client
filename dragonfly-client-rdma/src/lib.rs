@@ -14,15 +14,20 @@
  * limitations under the License.
  */
 
-//! Local discovery of verbs interfaces advertising message and RDMA Read support.
+//! Verbs discovery, owned native resources, reusable sessions and async workers.
 //!
 //! A candidate is not proof of hardware offload or a working remote connection.
 //! Fabric, Domain and completion queue ownership is managed through Rust RAII.
-//! Peer-to-peer validation remains a separate step.
+//! The blocking Session API exchanges messages, reads registered memory, and
+//! explicitly closes resources. Applications retain their own integrity checks. Target hardware still
+//! requires validation with examples/read_demo.rs.
 
 pub mod capability;
 pub mod error;
+pub mod limits;
 pub mod resource;
+pub mod session;
+pub mod worker;
 
 #[cfg(all(target_os = "linux", feature = "rdma"))]
 mod ffi;
@@ -31,5 +36,9 @@ pub use capability::{
     probe, EndpointType, ProbeOptions, ProbeResult, RdmaCapability, ReadCapabilities,
     UnavailableReason,
 };
-pub use error::{ProbeError, ResourceError};
+pub use error::{FabricError, ProbeError, ResourceError, SessionError};
+pub use limits::{Limits, ResourceBudget, ResourceUsage};
+pub const MAX_TRANSFER_SIZE: usize = 64 * 1024 * 1024;
 pub use resource::{CompletionQueue, CqOptions, Domain, Fabric, RdmaResources, ResourceOptions};
+pub use session::{Listener, RemoteRegion, Session, SessionOptions};
+pub use worker::SessionWorker;

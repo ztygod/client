@@ -91,7 +91,7 @@ jobs:
           verbose: true
 
   rdma:
-    name: RDMA discovery and resource ownership
+    name: RDMA discovery, resources and Read prototype
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
@@ -113,7 +113,7 @@ jobs:
       - name: Test feature-disabled behavior
         run: cargo test --locked -p dragonfly-client-rdma
 
-      - name: Test libfabric discovery and resources without RDMA hardware
+      - name: Test libfabric discovery, resources and RMA Read without RDMA hardware
         run: cargo test --locked -p dragonfly-client-rdma --all-features
 
       - name: Lint Linux FFI

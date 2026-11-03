@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-//! Local resource creation without endpoints, connections or registered memory.
+//! Owned libfabric resources and platform-independent resource options.
 //!
 //! Children keep their parents alive with reference counting. Handles deliberately
 //! implement neither Send nor Sync: provider threading requirements are not yet
@@ -24,8 +24,16 @@
 use crate::UnavailableReason;
 use crate::{RdmaCapability, ResourceError};
 
+pub(crate) mod completion;
 #[cfg(all(target_os = "linux", feature = "rdma"))]
-mod native;
+pub(crate) mod endpoint;
+pub(crate) mod fabric;
+#[cfg(all(target_os = "linux", feature = "rdma"))]
+pub(crate) mod handle;
+#[cfg(all(target_os = "linux", feature = "rdma"))]
+pub(crate) mod memory;
+pub use completion::CompletionQueue;
+pub use fabric::{Domain, Fabric};
 
 /// A polling CQ using FI_CQ_FORMAT_DATA and FI_WAIT_NONE.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,30 +49,6 @@ pub struct ResourceOptions {
     pub rx_cq: CqOptions,
 }
 
-/// An owned fabric. Open domains keep the underlying fabric alive.
-pub struct Fabric {
-    #[cfg(all(target_os = "linux", feature = "rdma"))]
-    inner: native::OwnedHandle,
-    #[cfg(not(all(target_os = "linux", feature = "rdma")))]
-    _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-/// An owned domain. Open completion queues keep the underlying domain alive.
-pub struct Domain {
-    #[cfg(all(target_os = "linux", feature = "rdma"))]
-    inner: native::OwnedHandle,
-    #[cfg(not(all(target_os = "linux", feature = "rdma")))]
-    _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-/// An owned completion queue. No raw handle or polling API is exposed yet.
-pub struct CompletionQueue {
-    #[cfg(all(target_os = "linux", feature = "rdma"))]
-    inner: native::OwnedHandle,
-    #[cfg(not(all(target_os = "linux", feature = "rdma")))]
-    _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
 #[cfg(not(all(target_os = "linux", feature = "rdma")))]
 fn unavailable() -> ResourceError {
     ResourceError::Unavailable(if cfg!(target_os = "linux") {
@@ -72,91 +56,6 @@ fn unavailable() -> ResourceError {
     } else {
         UnavailableReason::UnsupportedPlatform
     })
-}
-
-impl Fabric {
-    /// Re-queries and matches the entire candidate metadata snapshot before opening.
-    ///
-    /// Retains the selected fi_info, including provider-owned addressing details,
-    /// for subsequent domain creation. A stale or edited candidate is rejected.
-    pub fn open(candidate: &RdmaCapability) -> Result<Self, ResourceError> {
-        #[cfg(all(target_os = "linux", feature = "rdma"))]
-        {
-            native::open_fabric(candidate)
-        }
-        #[cfg(not(all(target_os = "linux", feature = "rdma")))]
-        {
-            let _ = candidate;
-            Err(unavailable())
-        }
-    }
-
-    pub fn open_domain(&self) -> Result<Domain, ResourceError> {
-        #[cfg(all(target_os = "linux", feature = "rdma"))]
-        {
-            native::open_domain(self)
-        }
-        #[cfg(not(all(target_os = "linux", feature = "rdma")))]
-        {
-            Err(unavailable())
-        }
-    }
-
-    /// Closes once all domains have closed. On failure the handle remains owned
-    /// and can be retried. Repeated successful closes are harmless.
-    pub fn try_close(&mut self) -> Result<(), ResourceError> {
-        #[cfg(all(target_os = "linux", feature = "rdma"))]
-        {
-            native::try_close(&mut self.inner)
-        }
-        #[cfg(not(all(target_os = "linux", feature = "rdma")))]
-        {
-            Err(unavailable())
-        }
-    }
-}
-
-impl Domain {
-    pub fn open_completion_queue(
-        &self,
-        options: CqOptions,
-    ) -> Result<CompletionQueue, ResourceError> {
-        #[cfg(all(target_os = "linux", feature = "rdma"))]
-        {
-            native::open_cq(self, options)
-        }
-        #[cfg(not(all(target_os = "linux", feature = "rdma")))]
-        {
-            let _ = options;
-            Err(unavailable())
-        }
-    }
-
-    /// Fails with InUse while completion queues are live; preserves failed handles.
-    pub fn try_close(&mut self) -> Result<(), ResourceError> {
-        #[cfg(all(target_os = "linux", feature = "rdma"))]
-        {
-            native::try_close(&mut self.inner)
-        }
-        #[cfg(not(all(target_os = "linux", feature = "rdma")))]
-        {
-            Err(unavailable())
-        }
-    }
-}
-
-impl CompletionQueue {
-    /// Reports native close failures and retains ownership for retry.
-    pub fn try_close(&mut self) -> Result<(), ResourceError> {
-        #[cfg(all(target_os = "linux", feature = "rdma"))]
-        {
-            native::try_close(&mut self.inner)
-        }
-        #[cfg(not(all(target_os = "linux", feature = "rdma")))]
-        {
-            Err(unavailable())
-        }
-    }
 }
 
 /// A fabric, one domain, and separate transmit/receive completion queues.

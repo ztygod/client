@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-use super::{CompletionQueue, CqOptions, Domain, Fabric};
-use crate::ffi::{error_message, select_candidate, SelectedInfo};
-use crate::{ProbeOptions, RdmaCapability, ResourceError};
+use crate::ffi::raw::*;
+use crate::ffi::SelectedInfo;
+use crate::ResourceError;
 use std::ffi::{c_int, c_void};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
@@ -26,56 +26,59 @@ type OpenDomain = unsafe extern "C" fn(*mut c_void, *const c_void, *mut *mut c_v
 type OpenCq = unsafe extern "C" fn(*mut c_void, usize, *mut *mut c_void) -> c_int;
 type Close = unsafe extern "C" fn(*mut c_void) -> c_int;
 
-unsafe extern "C" {
-    fn d7y_rdma_fabric_open(info: *const c_void, result: *mut *mut c_void) -> c_int;
-    fn d7y_rdma_domain_open(
-        fabric: *mut c_void,
-        info: *const c_void,
-        result: *mut *mut c_void,
-    ) -> c_int;
-    fn d7y_rdma_cq_open(domain: *mut c_void, size: usize, result: *mut *mut c_void) -> c_int;
-    fn d7y_rdma_close(resource: *mut c_void) -> c_int;
-}
-
 /// A private function table also lets tests inject allocation/close failures.
 #[derive(Clone, Copy)]
-struct Api {
-    fabric_open: OpenFabric,
-    domain_open: OpenDomain,
-    cq_open: OpenCq,
-    close: Close,
+pub(super) struct Api {
+    pub(super) fabric_open: OpenFabric,
+    pub(super) domain_open: OpenDomain,
+    pub(super) cq_open: OpenCq,
+    pub(super) close: Close,
 }
 
-const NATIVE: Api = Api {
+pub(super) const NATIVE: Api = Api {
     fabric_open: d7y_rdma_fabric_open,
     domain_open: d7y_rdma_domain_open,
     cq_open: d7y_rdma_cq_open,
     close: d7y_rdma_close,
 };
 
-pub(super) type OwnedHandle = Rc<Handle>;
+pub(crate) type OwnedHandle = Rc<Handle>;
 
 /// No Clone or raw-handle access is exposed to callers. A child owns a strong
 /// parent reference, so even dropping public wrappers in the wrong order is safe.
-pub(super) struct Handle {
+pub(crate) struct Handle {
     raw: Option<NonNull<c_void>>,
-    parent: Option<OwnedHandle>,
-    info: Option<SelectedInfo>,
-    api: Api,
+    dependencies: Vec<OwnedHandle>,
+    pub(super) info: Option<SelectedInfo>,
+    pub(super) api: Api,
     kind: &'static str,
 }
 
 fn native_error(operation: &'static str, code: c_int) -> ResourceError {
-    ResourceError::Libfabric {
-        operation,
-        code,
-        message: error_message(code),
-    }
+    crate::error::fabric_error(operation, code).into()
 }
 
 impl Handle {
-    fn create(
+    pub(super) fn create(
         parent: Option<OwnedHandle>,
+        info: Option<SelectedInfo>,
+        api: Api,
+        kind: &'static str,
+        operation: &'static str,
+        open: impl FnOnce(*mut *mut c_void) -> c_int,
+    ) -> Result<OwnedHandle, ResourceError> {
+        Self::with_dependencies(
+            parent.into_iter().collect(),
+            info,
+            api,
+            kind,
+            operation,
+            open,
+        )
+    }
+
+    fn with_dependencies(
+        dependencies: Vec<OwnedHandle>,
         info: Option<SelectedInfo>,
         api: Api,
         kind: &'static str,
@@ -92,14 +95,14 @@ impl Handle {
         ))?;
         Ok(Rc::new(Self {
             raw: Some(raw),
-            parent,
+            dependencies,
             info,
             api,
             kind,
         }))
     }
 
-    fn as_ptr(&self) -> Result<*mut c_void, ResourceError> {
+    pub(crate) fn as_ptr(&self) -> Result<*mut c_void, ResourceError> {
         self.raw.map(NonNull::as_ptr).ok_or(ResourceError::Closed {
             resource: self.kind,
         })
@@ -114,7 +117,7 @@ impl Handle {
             }
             self.raw = None;
             // Closed children must no longer keep parents busy.
-            self.parent = None;
+            self.dependencies.clear();
             self.info = None;
         }
         Ok(())
@@ -128,84 +131,48 @@ impl Drop for Handle {
             // alive if the provider fails to release a child; closing its parent
             // would violate libfabric's lifetime contract. No panic during unwind.
             tracing::error!(resource = self.kind, %error, "libfabric resource cleanup failed");
-            if let Some(parent) = self.parent.take() {
-                std::mem::forget(parent);
+            std::mem::forget(self.info.take());
+            for dependency in self.dependencies.drain(..) {
+                std::mem::forget(dependency);
             }
         }
     }
 }
 
-pub(super) fn try_close(handle: &mut OwnedHandle) -> Result<(), ResourceError> {
+pub(crate) fn try_close(handle: &mut OwnedHandle) -> Result<(), ResourceError> {
     let kind = handle.kind;
     Rc::get_mut(handle)
         .ok_or(ResourceError::InUse { resource: kind })?
         .close()
 }
 
-pub(super) fn open_fabric(candidate: &RdmaCapability) -> Result<Fabric, ResourceError> {
-    ProbeOptions {
-        provider: candidate.provider.clone(),
-        domain: Some(candidate.domain.clone()),
+#[cfg(test)]
+pub(crate) fn fail_close_for_test(handle: &mut OwnedHandle, fail: bool) {
+    unsafe extern "C" fn failure(_: *mut c_void) -> c_int {
+        -5
     }
-    .validate()?;
-    from_info(select_candidate(candidate)?, NATIVE)
+    Rc::get_mut(handle)
+        .expect("test handle must be exclusively owned")
+        .api
+        .close = if fail { failure } else { d7y_rdma_close };
 }
 
-fn from_info(info: SelectedInfo, api: Api) -> Result<Fabric, ResourceError> {
-    let raw_info = info.as_ptr();
-    let inner = Handle::create(None, Some(info), api, "Fabric", "fi_fabric", |result| {
-        // SAFETY: info is the deep-copied, live query result, output is writable.
-        unsafe { (api.fabric_open)(raw_info, result) }
-    })?;
-    Ok(Fabric { inner })
-}
-
-pub(super) fn open_domain(fabric: &Fabric) -> Result<Domain, ResourceError> {
-    let raw = fabric.inner.as_ptr()?;
-    let info = fabric
-        .inner
-        .info
-        .as_ref()
-        .expect("an open fabric retains the selected fi_info")
-        .as_ptr();
-    let api = fabric.inner.api;
-    let inner = Handle::create(
-        Some(Rc::clone(&fabric.inner)),
-        None,
-        api,
-        "Domain",
-        "fi_domain",
-        |result| {
-            // SAFETY: the parent and query result are retained for this call and the child.
-            unsafe { (api.domain_open)(raw, info, result) }
-        },
-    )?;
-    Ok(Domain { inner })
-}
-
-pub(super) fn open_cq(
-    domain: &Domain,
-    options: CqOptions,
-) -> Result<CompletionQueue, ResourceError> {
-    let raw = domain.inner.as_ptr()?;
-    let api = domain.inner.api;
-    let inner = Handle::create(
-        Some(Rc::clone(&domain.inner)),
-        None,
-        api,
-        "CQ",
-        "fi_cq_open",
-        |result| {
-            // SAFETY: domain is live and retained by the resulting completion queue.
-            unsafe { (api.cq_open)(raw, options.size, result) }
-        },
-    )?;
-    Ok(CompletionQueue { inner })
+/// Retain *all* bound resources until native close succeeds.
+pub(crate) fn own(
+    dependencies: Vec<OwnedHandle>,
+    kind: &'static str,
+    operation: &'static str,
+    open: impl FnOnce(*mut *mut c_void) -> c_int,
+) -> Result<OwnedHandle, ResourceError> {
+    Handle::with_dependencies(dependencies, None, NATIVE, kind, operation, open)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi::select_candidate;
+    use crate::resource::fabric::from_info;
+    use crate::{CqOptions, Fabric, ProbeOptions, RdmaCapability};
     use crate::{ProbeResult, RdmaResources, ResourceOptions};
     use std::cell::RefCell;
 
@@ -364,6 +331,45 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_retains_all_bound_resources_and_failed_close_is_retryable() {
+        STATE.with(|s| *s.borrow_mut() = State::default());
+        let mut fabric = fake_fabric_owner(&tcp_candidate()).unwrap();
+        let mut domain = fabric.open_domain().unwrap();
+        let mut tx = domain.open_completion_queue(CqOptions::default()).unwrap();
+        let mut rx = domain.open_completion_queue(CqOptions::default()).unwrap();
+        let raw_domain = domain.inner.as_ptr().unwrap();
+        let mut endpoint = Handle::with_dependencies(
+            vec![
+                Rc::clone(&domain.inner),
+                Rc::clone(&tx.inner),
+                Rc::clone(&rx.inner),
+            ],
+            None,
+            FAKE,
+            "Endpoint",
+            "fake_endpoint",
+            |result| unsafe { allocate(raw_domain, result) },
+        )
+        .unwrap();
+        assert!(matches!(tx.try_close(), Err(ResourceError::InUse { .. })));
+        assert!(matches!(rx.try_close(), Err(ResourceError::InUse { .. })));
+        STATE.with(|s| s.borrow_mut().fail_close_at = Some(1));
+        assert!(try_close(&mut endpoint).is_err());
+        STATE.with(|s| assert_eq!(s.borrow().live.len(), 5));
+        // No dependency was released by the failed close.
+        assert!(matches!(
+            domain.try_close(),
+            Err(ResourceError::InUse { .. })
+        ));
+        try_close(&mut endpoint).unwrap();
+        tx.try_close().unwrap();
+        rx.try_close().unwrap();
+        domain.try_close().unwrap();
+        fabric.try_close().unwrap();
+        STATE.with(|s| assert!(s.borrow().live.is_empty()));
+    }
+
+    #[test]
     fn partial_construction_rolls_back_at_every_allocation_stage() {
         let candidate = tcp_candidate();
         for failure in 1..=4 {
@@ -427,10 +433,10 @@ mod tests {
             STATE.with(|s| s.borrow_mut().fail_close_at = Some(failure));
             assert!(matches!(
                 resources.try_close(),
-                Err(ResourceError::Libfabric {
+                Err(ResourceError::Native(crate::FabricError {
                     operation: "fi_close",
                     ..
-                })
+                }))
             ));
             let expected_live: &[usize] = match failure {
                 1 => &[1, 2, 3, 4],

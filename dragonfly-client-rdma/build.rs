@@ -15,10 +15,11 @@
  */
 
 fn main() {
-    println!("cargo:rerun-if-changed=c/probe.c");
-    println!("cargo:rerun-if-changed=c/probe.h");
-    println!("cargo:rerun-if-changed=c/resource.c");
-    println!("cargo:rerun-if-changed=c/resource.h");
+    const SHIM_FILES: [&str; 5] = ["probe", "resource", "endpoint", "memory", "transfer"];
+    for name in SHIM_FILES {
+        println!("cargo:rerun-if-changed=c/{name}.c");
+        println!("cargo:rerun-if-changed=c/{name}.h");
+    }
 
     #[cfg(feature = "rdma")]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
@@ -35,19 +36,17 @@ fn main() {
             });
 
         let mut build = cc::Build::new();
-        build
-            .file("c/probe.c")
-            .file("c/resource.c")
-            .std("c11")
-            .warnings(true)
-            .warnings_into_errors(true);
+        for name in SHIM_FILES {
+            build.file(format!("c/{name}.c"));
+        }
+        build.std("c11").warnings(true).warnings_into_errors(true);
         for path in library.include_paths {
             build.include(path);
         }
         for (name, value) in library.defines {
             build.define(&name, value.as_deref());
         }
-        build.compile("dragonfly_rdma_probe");
+        build.compile("dragonfly_rdma_shim");
 
         // GNU --as-needed requires libfabric after the static shim that references it.
         pkg_config

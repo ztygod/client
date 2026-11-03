@@ -14,47 +14,13 @@
  * limitations under the License.
  */
 
+use super::raw::*;
 use crate::{
     EndpointType, ProbeError, ProbeOptions, ProbeResult, RdmaCapability, ReadCapabilities,
     ResourceError, UnavailableReason,
 };
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
-
-/// Stable snapshot shared with c/probe.h; all pointers borrow from an InfoList.
-#[repr(C)]
-#[derive(Default)]
-struct RawInfo {
-    provider: *const c_char,
-    domain: *const c_char,
-    device: *const c_char,
-    capabilities: u64,
-    mode: u64,
-    mr_mode: u64,
-    protocol: u32,
-    protocol_version: u32,
-    threading: u32,
-    control_progress: u32,
-    data_progress: u32,
-    messaging: u8,
-    rma: u8,
-    read: u8,
-    remote_read: u8,
-    remote_communication: u8,
-}
-
-unsafe extern "C" {
-    fn d7y_rdma_probe(
-        provider: *const c_char,
-        domain: *const c_char,
-        result: *mut *mut c_void,
-    ) -> c_int;
-    fn d7y_rdma_free_info(result: *mut c_void);
-    fn d7y_rdma_next_info(info: *const c_void) -> *mut c_void;
-    fn d7y_rdma_get_info(info: *const c_void, result: *mut RawInfo) -> c_int;
-    fn d7y_rdma_error_string(code: c_int) -> *const c_char;
-    fn d7y_rdma_dup_info(info: *const c_void) -> *mut c_void;
-}
 
 /// Owns the entire fi_info list, including when conversion exits early.
 struct InfoList(*mut c_void);
@@ -67,11 +33,7 @@ impl Drop for InfoList {
 }
 
 fn libfabric_error(operation: &'static str, code: c_int) -> ProbeError {
-    ProbeError::Libfabric {
-        operation,
-        code,
-        message: error_message(code),
-    }
+    crate::error::fabric_error(operation, code).into()
 }
 
 pub(crate) fn error_message(code: c_int) -> String {
@@ -228,6 +190,22 @@ pub(crate) struct SelectedInfo {
 }
 
 impl SelectedInfo {
+    pub(crate) fn duplicate(&self) -> Result<Self, ResourceError> {
+        let raw = unsafe { d7y_rdma_dup_info(self.as_ptr()) };
+        if raw.is_null() {
+            return Err(ResourceError::Allocation {
+                resource: "fi_info",
+            });
+        }
+        Ok(unsafe { Self::from_raw(raw) })
+    }
+    /// # Safety
+    /// `raw` must be an exclusively owned fi_getinfo/fi_dupinfo/CM event result.
+    pub(crate) unsafe fn from_raw(raw: *mut c_void) -> Self {
+        Self {
+            list: InfoList(raw),
+        }
+    }
     pub(crate) fn as_ptr(&self) -> *const c_void {
         self.list.0
     }
@@ -255,6 +233,42 @@ pub(crate) fn select_candidate(candidate: &RdmaCapability) -> Result<SelectedInf
         Ok(())
     })?;
     selected.ok_or(ResourceError::CandidateUnavailable)
+}
+
+pub(crate) fn query_session(
+    options: &crate::SessionOptions,
+    source: bool,
+) -> Result<SelectedInfo, crate::SessionError> {
+    let provider = CString::new(options.provider.as_str())
+        .map_err(|_| crate::SessionError::InvalidOptions("NUL in provider"))?;
+    let domain = options
+        .domain
+        .as_deref()
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| crate::SessionError::InvalidOptions("NUL in domain"))?;
+    let node = CString::new(options.node.as_str())
+        .map_err(|_| crate::SessionError::InvalidOptions("NUL in node"))?;
+    let service = CString::new(options.port.to_string())
+        .map_err(|_| crate::SessionError::InvalidOptions("invalid port encoding"))?;
+    let mut result = ptr::null_mut();
+    // SAFETY: inputs and output storage live for the synchronous query.
+    let code = unsafe {
+        d7y_rdma_session_query(
+            provider.as_ptr(),
+            domain.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+            node.as_ptr(),
+            service.as_ptr(),
+            i32::from(source),
+            &mut result,
+        )
+    };
+    // Adopt even a partial native result so failures cannot leak query memory.
+    let info = (!result.is_null()).then(|| unsafe { SelectedInfo::from_raw(result) });
+    crate::error::check("fi_getinfo(session)", code, 0)?;
+    info.ok_or(crate::SessionError::Protocol(
+        "query returned no connection info",
+    ))
 }
 
 #[cfg(test)]

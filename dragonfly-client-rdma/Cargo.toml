@@ -1,6 +1,6 @@
 [package]
 name = "dragonfly-client-rdma"
-description = "RDMA capability discovery and resource ownership for the dragonfly client"
+description = "Libfabric discovery, resource ownership and RDMA transport for the Dragonfly client"
 version.workspace = true
 authors.workspace = true
 homepage.workspace = true
@@ -17,6 +17,7 @@ rdma = ["dep:cc", "dep:pkg-config"]
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 
 [build-dependencies]
 cc = { workspace = true, optional = true }

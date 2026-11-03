@@ -110,6 +110,16 @@ pub enum UnavailableReason {
     NoMatchingInterface,
 }
 
+impl std::fmt::Display for UnavailableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnsupportedPlatform => "requires Linux",
+            Self::FeatureDisabled => "rebuild with the rdma feature",
+            Self::NoMatchingInterface => "no compatible provider/domain/interface",
+        })
+    }
+}
+
 /// Discovery output. Available means candidates were found, not that RDMA works.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProbeResult {
