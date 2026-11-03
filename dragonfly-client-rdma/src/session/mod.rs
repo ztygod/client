@@ -17,6 +17,9 @@
 //! Blocking sessions. Native resources stay on the thread that creates them.
 //! Failed or timed-out I/O retains its memory until endpoint close succeeds.
 
+mod exports;
+pub use exports::{ExportBuffer, ExportId, ExportedRegion};
+
 use crate::SessionError;
 use std::time::Duration;
 

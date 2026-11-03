@@ -37,6 +37,10 @@ objects are neither `Send` nor `Sync`; create and use them on one thread.
 
 - `send` and `receive` exchange bounded application control messages.
 - `export` registers immutable bytes and returns `RemoteRegion` metadata.
+- `reserve_export` preallocates both control buffers and reserves the next export
+  against the shared budget. Fill its `ExportBuffer`, then call `export_buffer` to
+  publish it without a copy. `export_tracked` accepts an existing `Vec` instead.
+  Both publication APIs return `ExportedRegion` with an application release ID.
 - `read` validates the region length and address range, waits for the matching
   Read completion, then returns owned bytes. The copy keeps thread-affine native
   registrations out of async consumers.
@@ -111,12 +115,62 @@ not yet exported to Dragonfly Prometheus metrics.
 
 Control send/receive buffers retain their registrations between requests. Local
 Read buffers reuse the largest successful allocation. There is one in-flight
-operation per connection. Exported regions remain registered until endpoint close,
-including after application acknowledgements: no lease expiry can recycle memory
-while a peer may still access it. Byte and registration limits bound retained
-exports. Sustained uploads need an application release protocol with safe MR
-revocation, or connection rotation; cross-session registered-buffer pools and
-concurrent operations are not implemented.
+operation per connection. Export lifetime management is described below.
+
+## Export admission, rotation and early release
+
+The default safe behavior still retains exported regions until successful endpoint
+close. A local Send completion or a timeout does not prove that a peer has stopped
+reading a region. Existing `export` callers retain this behavior.
+
+Use `reserve_export(length)` before generating/publishing the next payload. It
+initializes both control buffers, atomically reserves byte/registration capacity
+across the shared budget, and checks out an unpublished zeroed allocation. Fill
+`as_mut_slice()`, then publish with `export_buffer(buffer)`. Dropping an unused
+reservation returns its byte and registration permits. Reservations contain no
+native handles, may cross threads, and are valid only for their originating
+session. Consume or drop them before closing/rotating.
+
+Once control buffers are initialized, an admission `ResourceLimit` does not poison
+the session: the application can finish existing work, exchange a drain/rotate
+message, successfully close the old connection, and reconnect before retrying the
+unstarted request. Initial control-buffer setup failure requires closing/retrying;
+no transfer has been published by that reservation. Do not propagate an expected
+admission error out of an enclosing `transaction` if you intend to send a rotation
+message: failed transactions still poison the session. A usage snapshot is not a
+reservation, and raising limits only delays exhaustion. Refuse a request that
+cannot fit even an empty connection instead of rotating indefinitely.
+
+For trusted peers with a proven quiescence protocol, `unsafe release_export(id)`
+allows early deregistration. `ExportId` contains a process-local session identity
+and a monotonically increasing generation; IDs do not repeat within a process.
+Only successfully published exports issue IDs. Duplicate releases return `false`
+without storing unbounded tombstones; unknown/future/cross-session IDs are errors.
+These IDs validate control messages, not native RDMA access. They are not a
+hardware revocation mechanism or persistent identities across process restarts.
+
+The caller's safety obligation is that all peers have completed every operation
+against the region and will never use its old address/key again. A RELEASE sent
+only after all successful Read completions and after prohibiting further Reads can
+provide that promise in a trusted protocol. It cannot establish quiescence for an
+arbitrary or buggy peer. Validate provider revocation and key-reuse behavior before
+opting in; otherwise use connection rotation. Never release merely on TTL expiry.
+A failed MR close retains the MR, data and permits, poisons data operations, and
+allows release/connection-close retries. Only a successful deregistration returns
+storage to the cache and returns registration capacity.
+
+`ResourceBudget` shares a bounded cache of **unregistered allocations** across its
+sessions/workers: defaults are 8 MiB and 8 buffers. Configure
+`max_cached_export_bytes` / `max_cached_export_buffers`; zero disables retention.
+Checkouts match exact lengths and clear previous contents before returning bytes
+to the application. Each publication still performs a new MR registration and
+uses the provider's returned key. Live registrations are never pooled. This saves
+allocation/copying through `ExportBuffer`, not MR registration cost.
+`clear_export_cache()` trims only unused allocations. `ResourceUsage` separately
+reports cached bytes/buffers; registered bytes/count also include unpublished
+reservations. Total retained cache capacity is shared, rather than multiplied by
+the number of sessions. A persistent registered pool or hardware memory-window
+revocation remains future work requiring provider-specific validation.
 
 ## Cleanup and errors
 
@@ -163,7 +217,31 @@ cargo run -p dragonfly-client-rdma --features rdma --example read_demo -- \
 Both processes must print `VERIFIED` with matching byte count and checksum, close
 resources and exit zero. Every byte is compared against deterministic data; FNV-1a
 is only a diagnostic checksum. Test 1, 4096 and 4194304 bytes with different seeds.
-This trusted-peer diagnostic is not authenticated or an application piece server.
+This diagnostic is not authenticated or an application piece server. Its version 2
+wire format is incompatible with the original one-shot demo.
+
+The server accepts repeated requests and rotates before exhausting either export
+budget. To exercise rotation, set a small server budget and request many pieces:
+
+```bash
+# Host A: keeps the safe retain-until-close behavior.
+cargo run -p dragonfly-client-rdma --features rdma --example read_demo -- \
+  server --address 192.0.2.10 --registered-bytes 10485760
+# Host B: 128 verified pieces, reconnecting when the server requests rotation.
+cargo run -p dragonfly-client-rdma --features rdma --example read_demo -- \
+  client --address 192.0.2.10 --size 4194304 --requests 128
+```
+
+For controlled trusted-peer testing, add `--release-exports` to Host A. Every
+request then exchanges `RELEASE/RELEASED` containing the exact export identity,
+length and diagnostic checksum. The client sends RELEASE only after the matching
+Read completes and bytes verify, and never reuses its metadata. The server calls
+the unsafe release interface only in this explicit mode. Logs show registered
+bytes/regions and cached bytes after each request; the retained registered working
+set should stay stable. Missing or mismatched releases fail the transaction and
+retain exports for endpoint-close cleanup. Both modes refuse a request that cannot
+fit an empty connection. The demo ends with a final Done acknowledgement and
+closes all native resources.
 
 ## Tests and integration boundary
 
@@ -176,6 +254,10 @@ cargo clippy --locked -p dragonfly-client-rdma --all-targets --all-features -- -
 Linux feature tests use real libfabric with its software TCP provider. They cover
 repeated reads, reusable registrations, byte correctness, request cancellation,
 transaction deadlines, admission, pending-I/O cleanup and retrying close failures.
+Export lifecycle tests additionally cover 128 release/reuse cycles under a small
+budget, byte/registration-triggered rotation, stale and duplicate releases, failed
+deregistration retries, and missing-release cleanup. Platform-independent tests
+cover bounded/zeroed caches, cancelled reservations and versioned control frames.
 Ownership tests inject allocation/close failures. These tests need the TCP
 provider and an interface advertising remote communication, but no RDMA hardware.
 The software provider is private to tests and is rejected by public constructors.
@@ -195,7 +277,8 @@ benchmarks remain required.
   resource wrappers, mirrored by the C shim under `c/`.
 - `session/{mod,listener,connection,progress,unsupported}.rs`: options, connection
   lifecycle, polling and unavailable-platform behavior.
-- `limits.rs`: shared admission permits and counters; `worker.rs`: async boundary.
+- `session/exports.rs`: connection/generation identities and unpublished buffers.
+- `limits.rs`: shared admission, allocation cache and counters; `worker.rs`: async boundary.
 - `examples/read_demo.rs` and `examples/support/`: diagnostic application protocol.
 
 Native lifetime, completion and error contracts follow the libfabric 1.17 manuals

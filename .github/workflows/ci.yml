@@ -91,7 +91,7 @@ jobs:
           verbose: true
 
   rdma:
-    name: RDMA discovery, resources and Read prototype
+    name: RDMA sessions, export lifecycle and Read
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
@@ -111,10 +111,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfabric-dev pkg-config
 
       - name: Test feature-disabled behavior
-        run: cargo test --locked -p dragonfly-client-rdma
+        run: cargo test --locked -p dragonfly-client-rdma --all-targets
 
       - name: Test libfabric discovery, resources and RMA Read without RDMA hardware
-        run: cargo test --locked -p dragonfly-client-rdma --all-features
+        run: cargo test --locked -p dragonfly-client-rdma --all-features --all-targets
 
       - name: Lint Linux FFI
         run: cargo clippy --locked -p dragonfly-client-rdma --all-targets --all-features -- -D warnings

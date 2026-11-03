@@ -41,7 +41,16 @@ impl RegisteredBuffer {
         budget: &crate::ResourceBudget,
     ) -> Result<Self, SessionError> {
         let permit = budget.reserve(data.len())?;
-        let mut data = data.into_boxed_slice();
+        Self::register_reserved(domain, data.into_boxed_slice(), key, remote_read, permit)
+    }
+
+    pub(crate) fn register_reserved(
+        domain: &Domain,
+        mut data: Box<[u8]>,
+        key: u64,
+        remote_read: bool,
+        permit: crate::limits::Permit,
+    ) -> Result<Self, SessionError> {
         let raw = domain.inner.as_ptr()?;
         let mr = handle::own(
             vec![Rc::clone(&domain.inner)],
@@ -99,12 +108,16 @@ impl RegisteredBuffer {
         // SAFETY: the allocation stays fixed until deregistration succeeds.
         Ok(unsafe { d7y_rdma_mr_address(mode, self.data()?.as_ptr().cast()) })
     }
-    pub(crate) fn try_close(&mut self) -> Result<(), ResourceError> {
+    /// Returns storage only after the native MR is successfully deregistered.
+    pub(crate) fn deregister(&mut self) -> Result<Option<Box<[u8]>>, ResourceError> {
         if let Some(inner) = self.inner.as_mut() {
             handle::try_close(&mut inner.mr)?;
         }
-        self.inner.take();
-        Ok(())
+        Ok(self.inner.take().map(|inner| inner.data))
+    }
+
+    pub(crate) fn try_close(&mut self) -> Result<(), ResourceError> {
+        self.deregister().map(drop)
     }
 
     #[cfg(test)]

@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
+use super::exports::Exports;
 use super::progress::Progress;
-use super::{RemoteRegion, SessionOptions};
+use super::{ExportBuffer, ExportId, ExportedRegion, RemoteRegion, SessionOptions};
 use crate::error::check;
 use crate::ffi::{query_session as query, raw::*, SelectedInfo};
 use crate::resource::completion::operation::{Context, Kind, PendingOperation};
@@ -49,7 +50,7 @@ impl State {
 struct Resources {
     ep: Endpoint,
     pending: Option<PendingOperation>,
-    exports: Vec<RegisteredBuffer>,
+    exports: Exports<RegisteredBuffer>,
     send_buffer: Option<RegisteredBuffer>,
     receive_buffer: Option<RegisteredBuffer>,
     read_buffer: Option<RegisteredBuffer>,
@@ -144,7 +145,7 @@ impl Session {
             inner: Some(Box::new(Resources {
                 ep,
                 pending: None,
-                exports: Vec::new(),
+                exports: Exports::new()?,
                 send_buffer: None,
                 receive_buffer: None,
                 read_buffer: None,
@@ -308,21 +309,120 @@ impl Session {
             Ok(bytes)
         })
     }
-    /// Export immutable bytes. The session retains the MR until endpoint close.
-    /// Admission limits bound retained exports; no caller can recycle a live region.
-    #[tracing::instrument(level = "debug", skip_all, fields(bytes = data.len()))]
-    pub fn export(&mut self, data: Vec<u8>) -> Result<RemoteRegion, SessionError> {
+    /// Reserve an export AND both reusable control buffers before accepting a
+    /// transfer. Once control buffers are initialized, an admission ResourceLimit
+    /// leaves the session usable for an application-level drain/rotate exchange.
+    /// Initial control-buffer setup failure requires closing/retrying. Admission is
+    /// atomic across
+    /// the shared budget, unlike inspecting resource_usage(). A reservation must
+    /// be consumed or dropped before rotating/closing the connection.
+    pub fn reserve_export(&mut self, length: usize) -> Result<ExportBuffer, SessionError> {
+        if self.state != State::Connected {
+            return Err(self.invalid_state("reserve export"));
+        }
+        self.validate_length(length)?;
+        let limit = self.resources()?.budget.limits().max_message_size;
+        if self.resources()?.send_buffer.is_none() {
+            let buffer = self.register(zeroed(limit)?, false)?;
+            self.resources_mut()?.send_buffer = Some(buffer);
+        }
+        if self.resources()?.receive_buffer.is_none() {
+            let buffer = self.register(zeroed(limit)?, false)?;
+            self.resources_mut()?.receive_buffer = Some(buffer);
+        }
+        let r = self.resources()?;
+        r.exports.next_id()?;
+        ExportBuffer::allocate(r.exports.session(), length, &r.budget)
+    }
+
+    pub fn resource_usage(&self) -> Result<crate::ResourceUsage, SessionError> {
+        Ok(self.resources()?.budget.usage())
+    }
+
+    /// Publish an allocation obtained by reserve_export without copying it.
+    pub fn export_buffer(&mut self, buffer: ExportBuffer) -> Result<ExportedRegion, SessionError> {
+        self.transaction(|session| {
+            if buffer.session != session.resources()?.exports.session() {
+                return Err(SessionError::Protocol(
+                    "export reservation belongs to another session",
+                ));
+            }
+            let r = session.resources_mut()?;
+            r.exports.next_id()?;
+            let key = r.next_key;
+            r.next_key = key
+                .checked_add(1)
+                .ok_or(SessionError::Protocol("MR key exhausted"))?;
+            let buffer = RegisteredBuffer::register_reserved(
+                &r.domain,
+                buffer.data,
+                key,
+                true,
+                buffer.permit,
+            )?;
+            session.track_export(buffer)
+        })
+    }
+
+    /// Export immutable bytes with an application release identity. Prefer
+    /// reserve_export/export_buffer for recoverable admission and allocation reuse.
+    pub fn export_tracked(&mut self, data: Vec<u8>) -> Result<ExportedRegion, SessionError> {
         self.transaction(|session| {
             session.validate_length(data.len())?;
+            session.resources()?.exports.next_id()?;
             let buffer = session.register(data, true)?;
-            let region = RemoteRegion {
-                length: buffer.data()?.len() as u64,
-                address: buffer.address(session.resources()?.mr_mode)?,
-                key: buffer.key()?,
-            };
-            session.resources_mut()?.exports.push(buffer);
-            Ok(region)
+            session.track_export(buffer)
         })
+    }
+    fn track_export(&mut self, buffer: RegisteredBuffer) -> Result<ExportedRegion, SessionError> {
+        let region = RemoteRegion {
+            length: buffer.data()?.len() as u64,
+            address: buffer.address(self.resources()?.mr_mode)?,
+            key: buffer.key()?,
+        };
+        let id = self.resources_mut()?.exports.insert(buffer)?;
+        Ok(ExportedRegion { id, region })
+    }
+
+    /// Legacy export: retained until successful endpoint close.
+    #[tracing::instrument(level = "debug", skip_all, fields(bytes = data.len()))]
+    pub fn export(&mut self, data: Vec<u8>) -> Result<RemoteRegion, SessionError> {
+        self.export_tracked(data).map(|export| export.region)
+    }
+
+    /// Deregister one quiescent export and return its allocation to the bounded
+    /// cache. Returns false for a duplicate release in this session. Unknown,
+    /// future and cross-session identities are errors, with no resource changes.
+    /// A failed native close retains the MR, bytes and permit for retry, and
+    /// poisons data operations. Release/try_close may still retry cleanup.
+    ///
+    /// # Safety
+    /// All peers must have completed every operation targeting this export and
+    /// must never use its old address/key again. An acknowledgement is sufficient
+    /// only under an enforced, trusted-peer protocol providing those guarantees.
+    /// A timeout, checksum, generation field, or local Send completion alone is
+    /// not proof. Validate provider revocation/key reuse before opting into this
+    /// path. Otherwise retain exports and rotate the connection instead.
+    pub unsafe fn release_export(&mut self, id: ExportId) -> Result<bool, SessionError> {
+        if !matches!(self.state, State::Connected | State::Failed) {
+            return Err(self.invalid_state("release export"));
+        }
+        let r = self.resources_mut()?;
+        let Some(buffer) = r.exports.get_mut(id)? else {
+            return Ok(false);
+        };
+        let data = match buffer.deregister() {
+            Ok(data) => data,
+            Err(error) => {
+                self.state = State::Failed;
+                return Err(error.into());
+            }
+        };
+        r.exports.remove(id);
+        if let Some(data) = data {
+            r.budget.cache_export_buffer(data);
+        }
+        Ok(true)
     }
     /// Read a region and return initialized bytes after its matching CQ completion.
     /// Address/key errors are reported by the provider and poison the connection.
@@ -520,7 +620,7 @@ impl Session {
             p.buffer.try_close()?;
         }
         r.pending.take();
-        for buffer in &mut r.exports {
+        for buffer in r.exports.values_mut() {
             buffer.try_close()?;
         }
         r.exports.clear();

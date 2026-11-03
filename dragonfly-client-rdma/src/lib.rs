@@ -40,5 +40,7 @@ pub use error::{FabricError, ProbeError, ResourceError, SessionError};
 pub use limits::{Limits, ResourceBudget, ResourceUsage};
 pub const MAX_TRANSFER_SIZE: usize = 64 * 1024 * 1024;
 pub use resource::{CompletionQueue, CqOptions, Domain, Fabric, RdmaResources, ResourceOptions};
-pub use session::{Listener, RemoteRegion, Session, SessionOptions};
+pub use session::{
+    ExportBuffer, ExportId, ExportedRegion, Listener, RemoteRegion, Session, SessionOptions,
+};
 pub use worker::SessionWorker;

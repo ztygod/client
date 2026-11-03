@@ -19,7 +19,7 @@
 use crate::SessionError;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 /// Upper bounds for a listener or worker and every session it owns.
@@ -27,10 +27,13 @@ use std::sync::{
 pub struct Limits {
     /// Maximum live sessions, including bundles retained after close failure.
     pub max_sessions: usize,
-    /// Maximum total registered allocation size across the shared budget.
+    /// Maximum registered/reserved allocation bytes across the shared budget.
     pub max_registered_bytes: usize,
     /// Also bound native registration metadata for many small exports.
     pub max_registered_regions: usize,
+    /// Shared cache of deregistered export allocations. Zero disables caching.
+    pub max_cached_export_bytes: usize,
+    pub max_cached_export_buffers: usize,
     /// Stop admitting sessions after this many unrecoverable cleanup failures.
     pub max_cleanup_failures: usize,
     pub max_transfer_size: usize,
@@ -43,6 +46,8 @@ impl Default for Limits {
             max_sessions: 32,
             max_registered_bytes: 128 * 1024 * 1024,
             max_registered_regions: 1024,
+            max_cached_export_bytes: 8 * 1024 * 1024,
+            max_cached_export_buffers: 8,
             max_cleanup_failures: 1,
             max_transfer_size: 64 * 1024 * 1024,
             max_message_size: 4096,
@@ -80,12 +85,19 @@ impl Limits {
 /// Shared counters, retained by resource permits even after an owner is dropped.
 #[derive(Clone)]
 pub struct ResourceBudget(Arc<BudgetInner>);
+#[derive(Default)]
+struct ExportCache {
+    buffers: Vec<Box<[u8]>>,
+    bytes: usize,
+}
+
 struct BudgetInner {
     limits: Limits,
     sessions: AtomicUsize,
     registered_bytes: AtomicUsize,
     registered_regions: AtomicUsize,
     cleanup_failures: AtomicUsize,
+    cache: Mutex<ExportCache>,
 }
 /// Best-effort snapshot of shared counters. Cleanup failures are cumulative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +106,9 @@ pub struct ResourceUsage {
     pub registered_bytes: usize,
     pub registered_regions: usize,
     pub cleanup_failures: usize,
+    /// Unregistered bytes retained for reuse, separately bounded from live MRs.
+    pub cached_export_bytes: usize,
+    pub cached_export_buffers: usize,
 }
 impl ResourceBudget {
     pub fn new(limits: Limits) -> Result<Self, SessionError> {
@@ -104,18 +119,66 @@ impl ResourceBudget {
             registered_bytes: AtomicUsize::new(0),
             registered_regions: AtomicUsize::new(0),
             cleanup_failures: AtomicUsize::new(0),
+            cache: Mutex::new(ExportCache::default()),
         })))
     }
     pub fn limits(&self) -> &Limits {
         &self.0.limits
     }
     pub fn usage(&self) -> ResourceUsage {
+        let cache = self.0.cache.lock().unwrap_or_else(|e| e.into_inner());
         ResourceUsage {
             sessions: self.0.sessions.load(Ordering::Relaxed),
             registered_bytes: self.0.registered_bytes.load(Ordering::Relaxed),
             registered_regions: self.0.registered_regions.load(Ordering::Relaxed),
             cleanup_failures: self.0.cleanup_failures.load(Ordering::Relaxed),
+            cached_export_bytes: cache.bytes,
+            cached_export_buffers: cache.buffers.len(),
         }
+    }
+    /// Drop only deregistered cached allocations; live exports are unaffected.
+    pub fn clear_export_cache(&self) {
+        let mut cache = self.0.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.buffers.clear();
+        cache.bytes = 0;
+    }
+    #[cfg_attr(not(all(target_os = "linux", feature = "rdma")), allow(dead_code))]
+    pub(crate) fn take_export_buffer(&self, length: usize) -> Result<Box<[u8]>, SessionError> {
+        let mut cache = self.0.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = cache.buffers.iter().position(|b| b.len() == length) {
+            let mut data = cache.buffers.swap_remove(index);
+            cache.bytes -= length;
+            drop(cache);
+            // An unpublished checkout must never expose a previous peer's bytes.
+            data.fill(0);
+            return Ok(data);
+        }
+        drop(cache);
+        let mut data = Vec::new();
+        data.try_reserve_exact(length)
+            .map_err(|_| SessionError::Allocation { bytes: length })?;
+        data.resize(length, 0);
+        Ok(data.into_boxed_slice())
+    }
+    #[cfg_attr(not(all(target_os = "linux", feature = "rdma")), allow(dead_code))]
+    pub(crate) fn cache_export_buffer(&self, data: Box<[u8]>) {
+        let mut cache = self.0.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let limits = self.limits();
+        if data.len() > limits.max_cached_export_bytes || limits.max_cached_export_buffers == 0 {
+            return;
+        }
+        // Evict old size classes instead of retaining a cache that cannot serve
+        // the current workload. Native registrations are never in this cache.
+        while cache.buffers.len() >= limits.max_cached_export_buffers
+            || data.len() > limits.max_cached_export_bytes.saturating_sub(cache.bytes)
+        {
+            let Some(old) = cache.buffers.pop() else {
+                break;
+            };
+            cache.bytes -= old.len();
+        }
+        cache.bytes += data.len();
+        cache.buffers.push(data);
     }
     #[cfg_attr(not(all(target_os = "linux", feature = "rdma")), allow(dead_code))]
     pub(crate) fn reserve(&self, bytes: usize) -> Result<Permit, SessionError> {
@@ -256,6 +319,43 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn export_cache_is_shared_bounded_zeroed_and_can_be_trimmed() {
+        let budget = ResourceBudget::new(Limits {
+            max_cached_export_bytes: 12,
+            max_cached_export_buffers: 2,
+            ..Limits::default()
+        })
+        .unwrap();
+        budget.cache_export_buffer(vec![9; 8].into_boxed_slice());
+        let usage = budget.usage();
+        assert_eq!(usage.registered_bytes, 0);
+        assert_eq!(usage.cached_export_bytes, 8);
+        let data = budget.clone().take_export_buffer(8).unwrap();
+        assert_eq!(&*data, &[0; 8]);
+        assert_eq!(budget.usage().cached_export_bytes, 0);
+        budget.cache_export_buffer(data);
+        budget.cache_export_buffer(vec![1; 6].into_boxed_slice());
+        assert_eq!(budget.usage().cached_export_bytes, 6);
+        for _ in 0..4 {
+            budget.cache_export_buffer(vec![1; 1].into_boxed_slice());
+        }
+        assert_eq!(budget.usage().cached_export_buffers, 2);
+        budget.cache_export_buffer(vec![1; 13].into_boxed_slice());
+        assert_eq!(budget.usage().cached_export_buffers, 2);
+        budget.clear_export_cache();
+        assert_eq!(budget.usage().cached_export_bytes, 0);
+    }
+    #[test]
+    fn zero_cache_limit_disables_retention() {
+        let budget = ResourceBudget::new(Limits {
+            max_cached_export_bytes: 0,
+            ..Limits::default()
+        })
+        .unwrap();
+        budget.cache_export_buffer(vec![1].into_boxed_slice());
+        assert_eq!(budget.usage().cached_export_buffers, 0);
     }
     #[test]
     fn concurrent_admission_never_exceeds_the_limit() {

@@ -86,6 +86,26 @@ impl Session {
     pub fn export(&mut self, _: Vec<u8>) -> Result<RemoteRegion, SessionError> {
         Err(unavailable())
     }
+    pub fn reserve_export(&mut self, _: usize) -> Result<ExportBuffer, SessionError> {
+        Err(unavailable())
+    }
+    pub fn export_buffer(&mut self, _: ExportBuffer) -> Result<ExportedRegion, SessionError> {
+        Err(unavailable())
+    }
+    pub fn export_tracked(&mut self, _: Vec<u8>) -> Result<ExportedRegion, SessionError> {
+        Err(unavailable())
+    }
+    pub fn resource_usage(&self) -> Result<crate::ResourceUsage, SessionError> {
+        Err(unavailable())
+    }
+    /// Release a quiescent region on a supported platform.
+    ///
+    /// # Safety
+    /// All peers must have finished accessing the export and must never reuse its
+    /// address/key. See Session::release_export on Linux with the rdma feature.
+    pub unsafe fn release_export(&mut self, _: ExportId) -> Result<bool, SessionError> {
+        Err(unavailable())
+    }
     pub fn read(&mut self, _: RemoteRegion) -> Result<Vec<u8>, SessionError> {
         Err(unavailable())
     }

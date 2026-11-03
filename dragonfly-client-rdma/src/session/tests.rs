@@ -74,10 +74,26 @@ fn repeated_reads_reuse_control_and_local_registrations() {
                 .unwrap();
         }
         // Both registrations and the allocation survive a failed deregistration.
-        session.inner.as_mut().unwrap().exports[0].fail_close_for_test(true);
+        session
+            .inner
+            .as_mut()
+            .unwrap()
+            .exports
+            .values_mut()
+            .next()
+            .unwrap()
+            .fail_close_for_test(true);
         assert!(session.try_close().is_err());
         assert!(budget.usage().registered_bytes > 0);
-        session.inner.as_mut().unwrap().exports[0].fail_close_for_test(false);
+        session
+            .inner
+            .as_mut()
+            .unwrap()
+            .exports
+            .values_mut()
+            .next()
+            .unwrap()
+            .fail_close_for_test(false);
         session.try_close().unwrap();
         session.try_close().unwrap();
         listener.try_close().unwrap();
@@ -274,4 +290,280 @@ fn provider_read_errors_preserve_diagnostics_and_cleanup() {
     session.try_close().unwrap();
     assert_eq!(budget.usage().registered_bytes, 0);
     assert!(matches!(server.join().unwrap(), SessionError::Native(_)));
+}
+
+fn exported_bytes(export: ExportedRegion) -> Vec<u8> {
+    [
+        export.id.session.to_be_bytes().as_slice(),
+        export.id.generation.to_be_bytes().as_slice(),
+        &region_bytes(export.region),
+    ]
+    .concat()
+}
+fn decode_export(bytes: &[u8]) -> ExportedRegion {
+    assert_eq!(bytes.len(), 40);
+    ExportedRegion {
+        id: ExportId {
+            session: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+            generation: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+        },
+        region: decode_region(&bytes[16..]),
+    }
+}
+fn release_bytes(id: ExportId) -> Vec<u8> {
+    [id.session.to_be_bytes(), id.generation.to_be_bytes()].concat()
+}
+
+#[test]
+fn completed_exports_release_budget_and_reuse_only_deregistered_storage() {
+    let mut options = options();
+    options.limits.max_registered_bytes = 8192;
+    options.limits.max_message_size = 1024;
+    options.limits.max_registered_regions = 3;
+    options.limits.max_cached_export_bytes = 4096;
+    options.limits.max_cached_export_buffers = 1;
+    let server_options = options.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let budget = ResourceBudget::new(server_options.limits.clone()).unwrap();
+        let mut listener = Listener::bind_native(&server_options, budget.clone()).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut session = listener.accept().unwrap();
+        let mut previous = None;
+        let mut allocation = None;
+        for request in 0..128 {
+            session
+                .transaction(|session| {
+                    assert_eq!(session.receive()?, b"read");
+                    let mut data = session.reserve_export(4096)?;
+                    if let Some(pointer) = allocation {
+                        assert_eq!(data.as_slice().as_ptr(), pointer);
+                    }
+                    allocation = Some(data.as_slice().as_ptr());
+                    data.as_mut_slice().fill(request as u8);
+                    let export = session.export_buffer(data)?;
+                    if let Some(old) = previous {
+                        // SAFETY: this is a duplicate of an already completed release.
+                        assert!(!unsafe { session.release_export(old)? });
+                        assert_eq!(budget.usage().registered_bytes, 6144);
+                    }
+                    session.send(&exported_bytes(export))?;
+                    assert_eq!(session.receive()?, release_bytes(export.id));
+                    // SAFETY: our test peer waited for Read completion and will
+                    // never post another access using this registration.
+                    assert!(unsafe { session.release_export(export.id)? });
+                    assert!(!unsafe { session.release_export(export.id)? });
+                    assert_eq!(budget.usage().registered_bytes, 2048);
+                    assert_eq!(budget.usage().registered_regions, 2);
+                    assert_eq!(budget.usage().cached_export_bytes, 4096);
+                    previous = Some(export.id);
+                    session.send(b"released")
+                })
+                .unwrap();
+        }
+        let reserved = session.reserve_export(4096).unwrap();
+        assert_eq!(budget.usage().registered_bytes, 6144);
+        drop(reserved);
+        assert_eq!(budget.usage().registered_bytes, 2048);
+        session.try_close().unwrap();
+        listener.try_close().unwrap();
+        assert_eq!(budget.usage().registered_bytes, 0);
+        budget.clear_export_cache();
+        assert_eq!(budget.usage().cached_export_bytes, 0);
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let budget = ResourceBudget::new(options.limits.clone()).unwrap();
+    let mut session = connect(&options, budget.clone());
+    for request in 0..128 {
+        session
+            .transaction(|session| {
+                session.send(b"read")?;
+                let export = decode_export(&session.receive()?);
+                assert_eq!(session.read(export.region)?, vec![request as u8; 4096]);
+                session.send(&release_bytes(export.id))?;
+                assert_eq!(session.receive()?, b"released");
+                Ok(())
+            })
+            .unwrap();
+    }
+    session.try_close().unwrap();
+    assert_eq!(budget.usage().registered_bytes, 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn release_failure_retains_registration_until_retry_and_rejects_foreign_ids() {
+    let options = options();
+    let server_options = options.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let budget = ResourceBudget::new(server_options.limits.clone()).unwrap();
+        let mut listener = Listener::bind_native(&server_options, budget.clone()).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut session = listener.accept().unwrap();
+        let export = session.export_tracked(vec![7; 4096]).unwrap();
+        let foreign = ExportId {
+            session: export.id.session + 1,
+            ..export.id
+        };
+        let future = ExportId {
+            generation: export.id.generation + 1,
+            ..export.id
+        };
+        // SAFETY: none of these exports' metadata was published to any peer.
+        assert!(unsafe { session.release_export(foreign) }.is_err());
+        assert!(unsafe { session.release_export(future) }.is_err());
+        assert!(session.state == State::Connected);
+        session
+            .resources_mut()
+            .unwrap()
+            .exports
+            .get_mut(export.id)
+            .unwrap()
+            .unwrap()
+            .fail_close_for_test(true);
+        assert!(unsafe { session.release_export(export.id) }.is_err());
+        assert!(session.state == State::Failed);
+        assert_eq!(budget.usage().registered_bytes, 4096);
+        assert_eq!(budget.usage().registered_regions, 1);
+        assert_eq!(budget.usage().cached_export_bytes, 0);
+        let buffer = session
+            .resources_mut()
+            .unwrap()
+            .exports
+            .get_mut(export.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(buffer.data().unwrap(), &[7; 4096]);
+        buffer.fail_close_for_test(false);
+        assert!(unsafe { session.release_export(export.id) }.unwrap());
+        assert_eq!(budget.usage().registered_bytes, 0);
+        assert_eq!(budget.usage().cached_export_bytes, 4096);
+        session.try_close().unwrap();
+        listener.try_close().unwrap();
+        stop_tx.send(()).unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut session = connect(
+        &options,
+        ResourceBudget::new(options.limits.clone()).unwrap(),
+    );
+    stop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    session.try_close().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn admission_rotates_before_byte_or_region_exhaustion_without_poisoning() {
+    for region_bound in [false, true] {
+        let mut options = options();
+        options.limits.max_message_size = 1024;
+        options.limits.max_registered_bytes = if region_bound { 64 * 1024 } else { 10240 };
+        options.limits.max_registered_regions = if region_bound { 4 } else { 16 };
+        let server_options = options.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let budget = ResourceBudget::new(server_options.limits.clone()).unwrap();
+            let mut listener = Listener::bind_native(&server_options, budget.clone()).unwrap();
+            ready_tx.send(()).unwrap();
+            for connection in 0..3 {
+                let mut session = listener.accept().unwrap();
+                for request in 0..2 {
+                    assert_eq!(session.receive().unwrap(), b"read");
+                    let mut data = session.reserve_export(4096).unwrap();
+                    data.as_mut_slice().fill((connection * 2 + request) as u8);
+                    let export = session.export_buffer(data).unwrap();
+                    session.send(&exported_bytes(export)).unwrap();
+                    assert_eq!(session.receive().unwrap(), b"done");
+                    session.send(b"ok").unwrap();
+                }
+                if connection < 2 {
+                    assert_eq!(session.receive().unwrap(), b"read");
+                    let before = budget.usage();
+                    assert!(matches!(
+                        session.reserve_export(4096),
+                        Err(SessionError::ResourceLimit { .. })
+                    ));
+                    assert_eq!(before.registered_bytes, budget.usage().registered_bytes);
+                    assert_eq!(before.registered_regions, budget.usage().registered_regions);
+                    assert!(session.state == State::Connected);
+                    session.send(b"rotate").unwrap();
+                    assert_eq!(session.receive().unwrap(), b"rotate ack");
+                }
+                session.try_close().unwrap();
+                assert_eq!(budget.usage().registered_bytes, 0);
+                assert_eq!(budget.usage().registered_regions, 0);
+                assert_eq!(budget.usage().sessions, 0);
+            }
+            listener.try_close().unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let budget = ResourceBudget::new(options.limits.clone()).unwrap();
+        let mut session = connect(&options, budget.clone());
+        let mut completed = 0;
+        while completed < 6 {
+            session.send(b"read").unwrap();
+            let response = session.receive().unwrap();
+            if response == b"rotate" {
+                session.send(b"rotate ack").unwrap();
+                session.try_close().unwrap();
+                session = connect(&options, budget.clone());
+                continue;
+            }
+            let export = decode_export(&response);
+            assert_eq!(
+                session.read(export.region).unwrap(),
+                vec![completed as u8; 4096]
+            );
+            session.send(b"done").unwrap();
+            assert_eq!(session.receive().unwrap(), b"ok");
+            completed += 1;
+        }
+        session.try_close().unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn missing_release_and_failed_endpoint_close_keep_exports_live() {
+    let options = options();
+    let server_options = options.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let budget = ResourceBudget::new(server_options.limits.clone()).unwrap();
+        let mut listener = Listener::bind_native(&server_options, budget.clone()).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut session = listener.accept().unwrap();
+        let export = session.export_tracked(vec![7; 4096]).unwrap();
+        session.send(&exported_bytes(export)).unwrap();
+        session.timeout = Duration::from_millis(100);
+        assert!(matches!(session.receive(), Err(SessionError::Timeout(_))));
+        handle::fail_close_for_test(&mut session.inner.as_mut().unwrap().ep.handle, true);
+        assert!(session.try_close().is_err());
+        assert!(budget.usage().registered_bytes >= 4096);
+        assert_eq!(budget.usage().cached_export_bytes, 0);
+        assert!(session
+            .resources_mut()
+            .unwrap()
+            .exports
+            .get_mut(export.id)
+            .unwrap()
+            .is_some());
+        handle::fail_close_for_test(&mut session.inner.as_mut().unwrap().ep.handle, false);
+        session.try_close().unwrap();
+        assert_eq!(budget.usage().registered_bytes, 0);
+        listener.try_close().unwrap();
+        stop_tx.send(()).unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut session = connect(
+        &options,
+        ResourceBudget::new(options.limits.clone()).unwrap(),
+    );
+    let _export = decode_export(&session.receive().unwrap());
+    stop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    session.try_close().unwrap();
+    server.join().unwrap();
 }
