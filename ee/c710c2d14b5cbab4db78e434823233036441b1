@@ -1,0 +1,54 @@
+dragonfly-client-rdma/examples/read_demo.rs
+  s_a866201b71022f::t_987d7cd96c9dd4 177,182,225
+  s_a866201b71022f::t_b2be20b3a63009 17,20-23,26-29,32-40,42-46,48-53,57-94,98-99,105,108,113,122-131,133,135,139,142,145-146,148-150,155-157,159-165,169-176,178-181,183-185,187-224,226-235,237-268,276-286,293-294,300-303,314-320,324-325,328,330,333-334
+  s_a866201b71022f::t_5b75d6a4f3aa33 186,236
+dragonfly-client-rdma/examples/support/mod.rs
+  s_a866201b71022f::t_b2be20b3a63009 21,31,34-35,39-40,53-66,68-74,99-105,107,111,114-115,117,122-134,142-143,149-155,197-200,207-214,217-218,222-223,227-230
+  s_a866201b71022f::t_56132ac27e58f2 17-18,22,44-47,52,75-78,82,90,96,98,112-113,119-121,135-141,145,148,156,237-245,247-248,253,255-256
+  s_a866201b71022f::t_bf0cc309cca719 236
+dragonfly-client-rdma/src/session/exports.rs
+  s_a866201b71022f::t_be9920f9878f87 1-16,19-62,64-83,85-95,97-164
+  s_a866201b71022f::t_b630920721accd 17-18
+  s_a866201b71022f::t_499480ef229e22 63
+  s_a866201b71022f::t_7d7f62b21aa444 84
+  s_a866201b71022f::t_eaa988f26bb863 96
+dragonfly-client-rdma/src/limits.rs
+  s_a866201b71022f::t_2cb75799d72f40 22,34-36,49-50,88-93,100,109-111,122,129,135-154,156-175,177-181,324-360
+  s_a866201b71022f::t_4a9ffbf44bd516 30
+  s_a866201b71022f::t_bfed73ce16cec8 176
+dragonfly-client-rdma/src/resource/memory.rs
+  s_a866201b71022f::t_2cb75799d72f40 44-53,111-112,116-120
+.github/workflows/ci.yml
+  s_a866201b71022f::t_4a9ffbf44bd516 94,114,117
+dragonfly-client-rdma/README.md
+  s_a866201b71022f::t_4a9ffbf44bd516 40-43,118-173,220-244,257-260,280-281
+dragonfly-client-rdma/src/session/mod.rs
+  s_a866201b71022f::t_be9920f9878f87 20-22
+dragonfly-client-rdma/src/lib.rs
+  s_a866201b71022f::t_be9920f9878f87 43,45
+  s_a866201b71022f::t_2eb061d71c89f3 44
+dragonfly-client-rdma/src/session/tests.rs
+  s_a866201b71022f::t_4a9ffbf44bd516 530,541
+  s_a866201b71022f::t_abe6df3ec5dea2 77,80-81,84-85,88,91-92,95,294-529,531-540,542-569
+  s_a866201b71022f::t_b5fb565958ffef 78-79,82-83,89-90,93-94,96
+dragonfly-client-rdma/src/session/connection.rs
+  s_a866201b71022f::t_b6935712403e40 17,19,53,148,312-369,372,374,377-426,623
+dragonfly-client-rdma/src/session/unsupported.rs
+  s_a866201b71022f::t_ecea472b6a7368 89-108
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eec710c2d14b5cbab4db78e434823233036441b1",
+  "prompts": {},
+  "sessions": {
+    "s_a866201b71022f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19f38-598a-75d2-b852-161dcca73ca0",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "ztygod <2739022972@qq.com>"
+    }
+  }
+}
