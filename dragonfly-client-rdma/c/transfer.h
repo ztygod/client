@@ -28,6 +28,15 @@ int d7y_rdma_post_read(void *ep, void *data, size_t size, void *desc,
 /* 0 = empty, 1 = success, negative = error, including decoded CQ errors. */
 int d7y_rdma_cq_poll(void *cq, void **context, size_t *length, uint64_t *flags,
                 int *provider_error, char *diagnostic, size_t diagnostic_size);
+#define D7Y_RDMA_CQ_BATCH_MAX 32
+struct d7y_rdma_completion {
+    void *context;
+    size_t length;
+    uint64_t flags;
+};
+/* Returns 0..capacity completions, or a negative diagnostic error. */
+int d7y_rdma_cq_poll_many(void *cq, struct d7y_rdma_completion *entries, size_t capacity,
+                int *provider_error, char *diagnostic, size_t diagnostic_size);
 int d7y_rdma_is_again(int code);
 int d7y_rdma_completion_matches(uint64_t flags, int operation);
 

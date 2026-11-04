@@ -14,14 +14,27 @@
  * limitations under the License.
  */
 
-//! Two-host verbs Read diagnostic with reusable sessions and budget-aware rotation.
+//! Verify RDMA Read correctness and exported-memory lifecycle across two hosts.
+//!
+//! - Negotiate exported regions through control messages, perform Reads, and
+//!   compare every byte against deterministic test data.
+//! - Use --requests to exercise connection reuse. Lower the server registration
+//!   budget to exercise rotation and reconnection before budget exhaustion.
+//! - Enable --release-exports on the server to exercise trusted-peer
+//!   RELEASE/RELEASED handshakes, deregistration, and allocation cache reuse.
+//!   By default, exports remain registered until the connection closes.
+//! - Print VERIFIED, byte counts, checksums, and server resource counters, then
+//!   explicitly close connection and listener resources.
+//! - Requires Linux, --features rdma, and reachable verbs interfaces on both
+//!   hosts. This manual diagnostic measures no throughput and provides neither
+//!   production authentication nor safe release guarantees for arbitrary peers.
 
-mod support;
+mod read_export_protocol;
 use dragonfly_client_rdma::{Listener, Session, SessionError, SessionOptions, MAX_TRANSFER_SIZE};
+use read_export_protocol::{checksum, pattern, verify, Message};
 use std::error::Error;
 use std::process::ExitCode;
 use std::time::Duration;
-use support::{checksum, pattern, verify, Message};
 
 #[derive(Default)]
 struct Report {
@@ -53,7 +66,7 @@ fn serve(
         let Message::Request { length, seed } = request else {
             return Err(SessionError::Protocol("expected request"));
         };
-        let length_usize = support::validate_length(length)?;
+        let length_usize = read_export_protocol::validate_length(length)?;
         // Reserve before generating bytes, while control buffers can still carry
         // the drain exchange. Do not swallow unrelated native/allocation errors.
         let mut buffer = match session.reserve_export(length_usize) {
@@ -139,9 +152,10 @@ fn read_verify(
         if export.region.length != length as u64 || offered_seed != seed {
             return Err(SessionError::Protocol("region does not match request"));
         }
-        let data = session.read(export.region)?;
-        verify(&data, seed)?;
-        let digest = checksum(&data);
+        let digest = session.read_with(export.region, |data| {
+            verify(data, seed)?;
+            Ok(checksum(data))
+        })?;
         // No code path uses export.region after sending this promise. Read has
         // returned only after its matching successful CQ completion.
         session.send(
@@ -273,7 +287,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("expected server or client; use --help".into());
     };
     if role == "--help" || role == "-h" {
-        println!("Usage: read_demo server|client --address IP [--port 7471] [--domain DOMAIN] [--timeout-secs 30]
+        println!("Usage: verify_read_export_lifecycle server|client --address IP [--port 7471] [--domain DOMAIN] [--timeout-secs 30]
 \
                   Client: [--size 4194304] [--seed 42] [--requests 1]
 \
@@ -339,7 +353,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("read_demo failed: {error}");
+            eprintln!("verify_read_export_lifecycle failed: {error}");
             ExitCode::FAILURE
         }
     }

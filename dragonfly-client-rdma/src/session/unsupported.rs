@@ -109,6 +109,34 @@ impl Session {
     pub fn read(&mut self, _: RemoteRegion) -> Result<Vec<u8>, SessionError> {
         Err(unavailable())
     }
+    pub fn read_with<T>(
+        &mut self,
+        _: RemoteRegion,
+        _: impl FnOnce(&[u8]) -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        Err(unavailable())
+    }
+    pub fn read_lease(&mut self, _: RemoteRegion) -> Result<CompletedRead, SessionError> {
+        Err(unavailable())
+    }
+    pub fn read_many_with(
+        &mut self,
+        _: &[RemoteRegion],
+        _: ReadOptions,
+        _: impl FnMut(usize, CompletedRead) -> Result<(), SessionError>,
+    ) -> Result<(), SessionError> {
+        Err(unavailable())
+    }
+    pub(crate) fn read_many_until(
+        &mut self,
+        _: std::time::Instant,
+        _: &[RemoteRegion],
+        _: ReadOptions,
+        _: impl FnMut(usize, CompletedRead) -> Result<(), SessionError>,
+        _: impl Fn() -> bool,
+    ) -> Result<(), SessionError> {
+        Err(unavailable())
+    }
     pub fn try_close(&mut self) -> Result<(), SessionError> {
         Err(unavailable())
     }

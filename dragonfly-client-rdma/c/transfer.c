@@ -44,22 +44,23 @@ int d7y_rdma_post_read(void *ep, void *data, size_t size, void *desc,
     return (int)fi_read(ep, data, size, desc, FI_ADDR_UNSPEC, address, key, context);
 }
 
-int d7y_rdma_cq_poll(void *cq, void **context, size_t *length, uint64_t *flags,
+int d7y_rdma_cq_poll_many(void *cq, struct d7y_rdma_completion *entries, size_t capacity,
                 int *provider_error, char *diagnostic, size_t diagnostic_size)
 {
-    struct fi_cq_data_entry entry = {0};
-    ssize_t ret = fi_cq_read(cq, &entry, 1);
-    *context = NULL;
-    *length = 0;
-    *flags = 0;
+    /* len/buf/data are not defined for every operation kind. Initialize all
+     * fields before copying the stable ABI, even when a provider omits them. */
+    struct fi_cq_data_entry native[D7Y_RDMA_CQ_BATCH_MAX] = {0};
+    ssize_t ret;
+    size_t i;
     *provider_error = 0;
     if (diagnostic_size) diagnostic[0] = '\0';
+    if (!entries || !capacity || capacity > D7Y_RDMA_CQ_BATCH_MAX) return -FI_EINVAL;
+    ret = fi_cq_read(cq, native, capacity);
     if (ret == -FI_EAGAIN) return 0;
     if (ret == -FI_EAVAIL) {
         struct fi_cq_err_entry error = {0};
         ret = fi_cq_readerr(cq, &error, 0);
         if (ret < 0) return (int)ret;
-        *context = error.op_context;
         *provider_error = error.prov_errno;
         if (diagnostic_size) {
             const char *detail = fi_cq_strerror(cq, error.prov_errno,
@@ -71,11 +72,23 @@ int d7y_rdma_cq_poll(void *cq, void **context, size_t *length, uint64_t *flags,
         return error.err ? -error.err : -FI_EIO;
     }
     if (ret < 0) return (int)ret;
-    if (ret != 1) return -FI_EIO;
-    *context = entry.op_context;
-    *length = entry.len;
+    if ((size_t)ret > capacity) return -FI_EIO;
+    for (i = 0; i < (size_t)ret; i++) {
+        entries[i].context = native[i].op_context;
+        entries[i].length = native[i].len;
+        entries[i].flags = native[i].flags;
+    }
+    return (int)ret;
+}
+int d7y_rdma_cq_poll(void *cq, void **context, size_t *length, uint64_t *flags,
+                int *provider_error, char *diagnostic, size_t diagnostic_size)
+{
+    struct d7y_rdma_completion entry = {0};
+    int ret = d7y_rdma_cq_poll_many(cq, &entry, 1, provider_error, diagnostic, diagnostic_size);
+    *context = entry.context;
+    *length = entry.length;
     *flags = entry.flags;
-    return 1;
+    return ret;
 }
 int d7y_rdma_is_again(int code)
 {

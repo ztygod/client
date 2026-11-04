@@ -14,6 +14,17 @@
  * limitations under the License.
  */
 
+//! Check local RDMA capabilities and native resource creation.
+//!
+//! - Query whether the selected provider/domain supports FI_EP_MSG, messaging,
+//!   and remote reads.
+//! - Print device, MR mode, threading, and progress settings for troubleshooting.
+//! - With --open-resources, check creation and closure of Fabric, Domain, and
+//!   TX/RX completion queues.
+//! - Default builds and non-Linux targets report why RDMA is unavailable. Native
+//!   checks require Linux, --features rdma, and libfabric. Local candidates alone
+//!   do not establish peer connectivity or throughput.
+
 use dragonfly_client_rdma::{
     probe, ProbeOptions, ProbeResult, RdmaResources, ResourceOptions, UnavailableReason,
 };
@@ -38,7 +49,7 @@ fn main() -> ExitCode {
                 }
             }
             "-h" | "--help" => {
-                println!("Usage: probe [--provider verbs] [--domain DOMAIN] [--open-resources]");
+                println!("Usage: check_rdma_capabilities [--provider verbs] [--domain DOMAIN] [--open-resources]");
                 return ExitCode::SUCCESS;
             }
             _ => {

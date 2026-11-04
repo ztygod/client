@@ -14,8 +14,17 @@
  * limitations under the License.
  */
 
-//! Version 2 diagnostic protocol. RELEASE is a trusted-peer promise that all
-//! Reads completed and this export's address/key will never be used again.
+//! Versioned diagnostic protocol and validation for verify_read_export_lifecycle.
+//!
+//! - Encode and decode requests, export metadata, RELEASE/RELEASED, connection
+//!   rotation, and final acknowledgements.
+//! - Validate frame versions, types, reserved fields, export identities, and
+//!   remote-region bounds.
+//! - Generate deterministic payloads with byte comparisons and diagnostic checksums.
+//! - Unit tests cover protocol round trips, invalid frames/bounds, and corruption.
+//! - RELEASE is a trusted client's promise that Reads have completed and the old
+//!   address/key will never be reused. These messages are not the production
+//!   Dragonfly piece protocol and provide no peer authentication.
 
 pub use dragonfly_client_rdma::MAX_TRANSFER_SIZE;
 use dragonfly_client_rdma::{ExportId, ExportedRegion, RemoteRegion, SessionError};

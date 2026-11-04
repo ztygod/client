@@ -81,13 +81,42 @@ pub(crate) mod operation {
         pub(crate) kind: Kind,
     }
 
-    pub(crate) struct Completion {
-        pub(crate) context: *mut c_void,
-        pub(crate) length: usize,
-        pub(crate) flags: u64,
-    }
+    pub(crate) use crate::ffi::raw::RawCompletion as Completion;
+    pub(crate) const CQ_BATCH_SIZE: usize = 16;
 
     impl CompletionQueue {
+        pub(crate) fn poll_many(&self, entries: &mut [Completion]) -> Result<usize, SessionError> {
+            if entries.is_empty() || entries.len() > 32 {
+                return Err(SessionError::InvalidOptions(
+                    "CQ batch must contain 1..=32 entries",
+                ));
+            }
+            let mut provider_error = 0;
+            let mut diagnostic = [0; 512];
+            // SAFETY: entries is caller-owned writable C-layout storage. The
+            // shim copies provider diagnostics before another queue read.
+            let code = unsafe {
+                d7y_rdma_cq_poll_many(
+                    self.inner.as_ptr()?,
+                    entries.as_mut_ptr(),
+                    entries.len(),
+                    &mut provider_error,
+                    diagnostic.as_mut_ptr(),
+                    diagnostic.len(),
+                )
+            };
+            check_diagnostic(
+                "fi_cq_read/readerr batch",
+                code,
+                provider_error,
+                &diagnostic,
+            )?;
+            let count = code as usize;
+            if count > entries.len() {
+                return Err(SessionError::Protocol("CQ batch exceeds capacity"));
+            }
+            Ok(count)
+        }
         pub(crate) fn poll(&self) -> Result<Option<Completion>, SessionError> {
             let mut context = ptr::null_mut();
             let (mut length, mut flags, mut provider_error) = (0, 0, 0);
@@ -113,7 +142,7 @@ pub(crate) mod operation {
     }
 }
 
-/// An owned completion queue. No raw handle or polling API is exposed yet.
+/// An owned completion queue. Native polling remains private to the transport.
 pub struct CompletionQueue {
     #[cfg(all(target_os = "linux", feature = "rdma"))]
     pub(crate) inner: handle::OwnedHandle,

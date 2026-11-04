@@ -567,3 +567,262 @@ fn missing_release_and_failed_endpoint_close_keep_exports_live() {
     session.try_close().unwrap();
     server.join().unwrap();
 }
+
+#[test]
+fn zero_copy_reads_reuse_storage_and_leases_survive_native_close() {
+    let options = options();
+    let server_options = options.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let budget = ResourceBudget::new(server_options.limits.clone()).unwrap();
+        let mut listener = Listener::bind_native(&server_options, budget).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut session = listener.accept().unwrap();
+        let region = session.export(vec![7; 4096]).unwrap();
+        session.send(&region_bytes(region)).unwrap();
+        assert_eq!(session.receive().unwrap(), b"done");
+        session.send(b"ok").unwrap();
+        session.try_close().unwrap();
+        listener.try_close().unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let budget = ResourceBudget::new(options.limits.clone()).unwrap();
+    let mut session = connect(&options, budget.clone());
+    let region = decode_region(&session.receive().unwrap());
+    let first_pointer = session
+        .read_with(region, |data| {
+            assert_eq!(data, &[7; 4096]);
+            Ok(data.as_ptr() as usize)
+        })
+        .unwrap();
+    for _ in 0..8 {
+        assert_eq!(
+            session
+                .read_with(region, |data| Ok(data.as_ptr() as usize))
+                .unwrap(),
+            first_pointer
+        );
+    }
+    let lease = session.read_lease(region).unwrap();
+    assert_eq!(lease.as_slice().as_ptr() as usize, first_pointer);
+    let cloned = lease.clone();
+    let second = session.read_lease(region).unwrap();
+    assert_ne!(lease.as_slice().as_ptr(), second.as_slice().as_ptr());
+    assert_eq!(lease.as_slice(), &[7; 4096]);
+    drop(second);
+    session.send(b"done").unwrap();
+    assert_eq!(session.receive().unwrap(), b"ok");
+    session.try_close().unwrap();
+    // The completed lease owns bytes/admission only, not a native Domain/MR.
+    assert_eq!(budget.usage().sessions, 0);
+    assert_eq!(budget.usage().registered_bytes, 4096);
+    drop(lease);
+    std::thread::spawn(move || assert_eq!(cloned.as_slice(), &[7; 4096]))
+        .join()
+        .unwrap();
+    assert_eq!(budget.usage().registered_bytes, 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn windowed_reads_preserve_input_identity_and_bound_registered_working_set() {
+    use crate::ReadOptions;
+    let mut options = options();
+    options.limits.max_read_buffers = 4;
+    options.limits.max_read_buffer_bytes = 32768;
+    let server_options = options.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let budget = ResourceBudget::new(server_options.limits.clone()).unwrap();
+        let mut listener = Listener::bind_native(&server_options, budget).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut session = listener.accept().unwrap();
+        let region = session
+            .export((0..65536).map(|i| (i % 251) as u8).collect())
+            .unwrap();
+        session.send(&region_bytes(region)).unwrap();
+        assert_eq!(session.receive().unwrap(), b"done");
+        session.send(b"ok").unwrap();
+        session.try_close().unwrap();
+        listener.try_close().unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let budget = ResourceBudget::new(options.limits.clone()).unwrap();
+    let mut session = connect(&options, budget.clone());
+    let region = decode_region(&session.receive().unwrap());
+    let regions: Vec<_> = (0..128)
+        .map(|index| RemoteRegion {
+            address: region.address + (index * 128) as u64,
+            length: [1, 2048, 4096, 8192][index % 4],
+            key: region.key,
+        })
+        .collect();
+    for _ in 0..4 {
+        let mut seen = vec![false; regions.len()];
+        session
+            .read_many_with(
+                &regions,
+                ReadOptions {
+                    max_in_flight: 4,
+                    max_in_flight_bytes: 16384,
+                },
+                |index, data| {
+                    assert!(!seen[index]);
+                    seen[index] = true;
+                    assert_eq!(data.len(), regions[index].length as usize);
+                    assert!(data
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, byte)| *byte == ((index * 128 + offset) % 251) as u8));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(seen.into_iter().all(|seen| seen));
+        assert!(session.resources().unwrap().read_pool.len() <= 4);
+        assert!(session.resources().unwrap().read_pool_bytes <= 32768);
+        assert!(session.resources().unwrap().reads.is_none());
+    }
+    session.send(b"done").unwrap();
+    assert_eq!(session.receive().unwrap(), b"ok");
+    session.try_close().unwrap();
+    assert_eq!(budget.usage().registered_bytes, 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn failed_batch_retains_every_unconfirmed_operation_until_endpoint_close() {
+    use crate::ReadOptions;
+    let options = options();
+    let server_options = options.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let budget = ResourceBudget::new(server_options.limits.clone()).unwrap();
+        let mut listener = Listener::bind_native(&server_options, budget).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut session = listener.accept().unwrap();
+        let region = session.export(vec![3; 4096]).unwrap();
+        session.send(&region_bytes(region)).unwrap();
+        assert!(session.receive().is_err());
+        session.try_close().unwrap();
+        listener.try_close().unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let budget = ResourceBudget::new(options.limits.clone()).unwrap();
+    let mut session = connect(&options, budget.clone());
+    let region = decode_region(&session.receive().unwrap());
+    let invalid = RemoteRegion {
+        key: region.key.wrapping_add(1),
+        ..region
+    };
+    let failure = session.read_many_with(
+        &[region, invalid, region],
+        ReadOptions::default(),
+        |_, _| Ok(()),
+    );
+    assert!(matches!(
+        failure,
+        Err(SessionError::Native(_)) | Err(SessionError::Disconnected)
+    ));
+    assert!(!session
+        .resources()
+        .unwrap()
+        .reads
+        .as_ref()
+        .unwrap()
+        .is_empty());
+    let retained = budget.usage().registered_bytes;
+    handle::fail_close_for_test(&mut session.inner.as_mut().unwrap().ep.handle, true);
+    assert!(session.try_close().is_err());
+    assert_eq!(budget.usage().registered_bytes, retained);
+    handle::fail_close_for_test(&mut session.inner.as_mut().unwrap().ep.handle, false);
+    session.try_close().unwrap();
+    assert_eq!(budget.usage().registered_bytes, 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn callback_cancellation_drains_all_submitted_reads_and_keeps_session_reusable() {
+    use crate::ReadOptions;
+    let options = options();
+    let server_options = options.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let budget = ResourceBudget::new(server_options.limits.clone()).unwrap();
+        let mut listener = Listener::bind_native(&server_options, budget).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut session = listener.accept().unwrap();
+        let region = session.export(vec![5; 4096]).unwrap();
+        session.send(&region_bytes(region)).unwrap();
+        assert_eq!(session.receive().unwrap(), b"after cancel");
+        session.send(b"ok").unwrap();
+        session.try_close().unwrap();
+        listener.try_close().unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let budget = ResourceBudget::new(options.limits.clone()).unwrap();
+    let mut session = connect(&options, budget.clone());
+    let region = decode_region(&session.receive().unwrap());
+    let mut callbacks = 0;
+    let result = session.read_many_with(&[region; 32], ReadOptions::default(), |_, data| {
+        assert_eq!(data.as_slice(), &[5; 4096]);
+        callbacks += 1;
+        Err(SessionError::Cancelled)
+    });
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+    assert_eq!(callbacks, 1);
+    assert!(session.state == State::Connected);
+    assert!(session.resources().unwrap().reads.is_none());
+    session.send(b"after cancel").unwrap();
+    assert_eq!(session.receive().unwrap(), b"ok");
+    session.try_close().unwrap();
+    assert_eq!(budget.usage().registered_bytes, 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn consumer_held_pool_capacity_observes_deadline_and_preserves_completed_bytes() {
+    use crate::ReadOptions;
+    let mut options = options();
+    options.limits.max_read_buffers = 1;
+    let server_options = options.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let budget = ResourceBudget::new(server_options.limits.clone()).unwrap();
+        let mut listener = Listener::bind_native(&server_options, budget).unwrap();
+        ready_tx.send(()).unwrap();
+        let mut session = listener.accept().unwrap();
+        let region = session.export(vec![6; 4096]).unwrap();
+        session.send(&region_bytes(region)).unwrap();
+        assert!(session.receive().is_err());
+        session.try_close().unwrap();
+        listener.try_close().unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let budget = ResourceBudget::new(options.limits.clone()).unwrap();
+    let mut session = connect(&options, budget.clone());
+    let region = decode_region(&session.receive().unwrap());
+    session.timeout = Duration::from_millis(80);
+    let mut held = None;
+    let result = session.read_many_with(
+        &[region; 2],
+        ReadOptions {
+            max_in_flight: 1,
+            max_in_flight_bytes: 4096,
+        },
+        |_, data| {
+            held = Some(data);
+            Ok(())
+        },
+    );
+    assert!(matches!(result, Err(SessionError::Timeout(_))));
+    assert!(session.state == State::Failed);
+    let held = held.unwrap();
+    assert_eq!(held.as_slice(), &[6; 4096]);
+    session.try_close().unwrap();
+    assert_eq!(budget.usage().registered_bytes, 4096);
+    assert_eq!(held.as_slice(), &[6; 4096]);
+    drop(held);
+    assert_eq!(budget.usage().registered_bytes, 0);
+    server.join().unwrap();
+}

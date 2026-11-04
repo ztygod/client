@@ -18,7 +18,9 @@
 //! Failed or timed-out I/O retains its memory until endpoint close succeeds.
 
 mod exports;
+pub(crate) mod read;
 pub use exports::{ExportBuffer, ExportId, ExportedRegion};
+pub use read::{CompletedRead, ReadCompletion, ReadOptions};
 
 use crate::SessionError;
 use std::time::Duration;

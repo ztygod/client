@@ -94,6 +94,8 @@ pub enum SessionError {
     },
     #[error("allocation of {bytes} bytes failed")]
     Allocation { bytes: usize },
+    #[error("RDMA read cancelled after draining submitted operations")]
+    Cancelled,
     #[error("RDMA worker stopped")]
     WorkerStopped,
     #[error("message length {actual} exceeds limit {limit}")]

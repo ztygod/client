@@ -16,6 +16,9 @@
 
 use super::exports::Exports;
 use super::progress::Progress;
+use super::read::ReadWindow;
+#[path = "reads.rs"]
+mod reads;
 use super::{ExportBuffer, ExportId, ExportedRegion, RemoteRegion, SessionOptions};
 use crate::error::check;
 use crate::ffi::{query_session as query, raw::*, SelectedInfo};
@@ -53,7 +56,10 @@ struct Resources {
     exports: Exports<RegisteredBuffer>,
     send_buffer: Option<RegisteredBuffer>,
     receive_buffer: Option<RegisteredBuffer>,
-    read_buffer: Option<RegisteredBuffer>,
+    read_pool: Vec<RegisteredBuffer>,
+    read_pool_bytes: usize,
+    reads: Option<ReadWindow<reads::NativeRead>>,
+    spare_reads: Option<ReadWindow<reads::NativeRead>>,
     tx: CompletionQueue,
     rx: CompletionQueue,
     eq: EventQueue,
@@ -148,7 +154,10 @@ impl Session {
                 exports: Exports::new()?,
                 send_buffer: None,
                 receive_buffer: None,
-                read_buffer: None,
+                read_pool: Vec::new(),
+                read_pool_bytes: 0,
+                reads: None,
+                spare_reads: None,
                 tx,
                 rx,
                 eq,
@@ -424,30 +433,6 @@ impl Session {
         }
         Ok(true)
     }
-    /// Read a region and return initialized bytes after its matching CQ completion.
-    /// Address/key errors are reported by the provider and poison the connection.
-    #[tracing::instrument(level = "debug", skip_all, fields(bytes = region.length))]
-    pub fn read(&mut self, region: RemoteRegion) -> Result<Vec<u8>, SessionError> {
-        self.transaction(|session| {
-            let length = region.validate(session.resources()?.budget.limits().max_transfer_size)?;
-            session.validate_length(length)?;
-            let old = session.resources_mut()?.read_buffer.take();
-            let buffer = match old {
-                Some(buffer) if buffer.data()?.len() >= length => buffer,
-                Some(mut buffer) => {
-                    buffer.try_close()?;
-                    session.register(zeroed(length)?, false)?
-                }
-                None => session.register(zeroed(length)?, false)?,
-            };
-            let (buffer, _) =
-                session.transfer(buffer, Kind::Read, region.address, region.key, length)?;
-            let mut bytes = zeroed(length)?;
-            bytes.copy_from_slice(&buffer.data()?[..length]);
-            session.resources_mut()?.read_buffer = Some(buffer);
-            Ok(bytes)
-        })
-    }
     fn validate_length(&self, length: usize) -> Result<(), SessionError> {
         let r = self.resources()?;
         if length == 0 || length > r.max_size.min(r.budget.limits().max_transfer_size) {
@@ -620,15 +605,23 @@ impl Session {
             p.buffer.try_close()?;
         }
         r.pending.take();
+        if let Some(reads) = r.reads.as_mut() {
+            for entry in &mut reads.entries {
+                entry.value.buffer.try_close()?;
+            }
+        }
+        r.reads.take();
+        r.spare_reads.take();
+        for buffer in &mut r.read_pool {
+            buffer.try_close()?;
+        }
+        r.read_pool.clear();
+        r.read_pool_bytes = 0;
         for buffer in r.exports.values_mut() {
             buffer.try_close()?;
         }
         r.exports.clear();
-        for slot in [
-            &mut r.send_buffer,
-            &mut r.receive_buffer,
-            &mut r.read_buffer,
-        ] {
+        for slot in [&mut r.send_buffer, &mut r.receive_buffer] {
             if let Some(buffer) = slot.as_mut() {
                 buffer.try_close()?;
             }

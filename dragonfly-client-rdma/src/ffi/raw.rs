@@ -38,6 +38,15 @@ pub(crate) struct RawInfo {
     pub(super) remote_communication: u8,
 }
 
+/// Stable CQ batch ABI shared with c/transfer.h.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RawCompletion {
+    pub(crate) context: *mut c_void,
+    pub(crate) length: usize,
+    pub(crate) flags: u64,
+}
+
 unsafe extern "C" {
     pub(crate) fn d7y_rdma_fabric_open(info: *const c_void, result: *mut *mut c_void) -> c_int;
     pub(crate) fn d7y_rdma_domain_open(
@@ -138,6 +147,14 @@ unsafe extern "C" {
         context: *mut *mut c_void,
         length: *mut usize,
         flags: *mut u64,
+        provider_error: *mut c_int,
+        diagnostic: *mut c_char,
+        diagnostic_size: usize,
+    ) -> c_int;
+    pub(crate) fn d7y_rdma_cq_poll_many(
+        cq: *mut c_void,
+        entries: *mut RawCompletion,
+        capacity: usize,
         provider_error: *mut c_int,
         diagnostic: *mut c_char,
         diagnostic_size: usize,

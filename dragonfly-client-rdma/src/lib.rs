@@ -20,7 +20,7 @@
 //! Fabric, Domain and completion queue ownership is managed through Rust RAII.
 //! The blocking Session API exchanges messages, reads registered memory, and
 //! explicitly closes resources. Applications retain their own integrity checks. Target hardware still
-//! requires validation with examples/read_demo.rs.
+//! requires validation with examples/verify_read_export_lifecycle.rs.
 
 pub mod capability;
 pub mod error;
@@ -41,6 +41,7 @@ pub use limits::{Limits, ResourceBudget, ResourceUsage};
 pub const MAX_TRANSFER_SIZE: usize = 64 * 1024 * 1024;
 pub use resource::{CompletionQueue, CqOptions, Domain, Fabric, RdmaResources, ResourceOptions};
 pub use session::{
-    ExportBuffer, ExportId, ExportedRegion, Listener, RemoteRegion, Session, SessionOptions,
+    CompletedRead, ExportBuffer, ExportId, ExportedRegion, Listener, ReadCompletion, ReadOptions,
+    RemoteRegion, Session, SessionOptions,
 };
-pub use worker::SessionWorker;
+pub use worker::{ReadStream, SessionWorker};

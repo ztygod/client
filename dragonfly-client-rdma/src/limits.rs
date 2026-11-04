@@ -38,6 +38,9 @@ pub struct Limits {
     pub max_cleanup_failures: usize,
     pub max_transfer_size: usize,
     pub max_message_size: usize,
+    /// Per-connection registered Read pool, including leased/completing buffers.
+    pub max_read_buffers: usize,
+    pub max_read_buffer_bytes: usize,
     pub completion_queue_size: usize,
 }
 impl Default for Limits {
@@ -51,6 +54,8 @@ impl Default for Limits {
             max_cleanup_failures: 1,
             max_transfer_size: 64 * 1024 * 1024,
             max_message_size: 4096,
+            max_read_buffers: 8,
+            max_read_buffer_bytes: 64 * 1024 * 1024,
             completion_queue_size: 64,
         }
     }
@@ -65,6 +70,9 @@ impl Limits {
             || self.max_transfer_size > 64 * 1024 * 1024
             || self.max_message_size == 0
             || self.max_message_size > 64 * 1024
+            || self.max_read_buffers == 0
+            || self.max_read_buffers > 1024
+            || self.max_read_buffer_bytes == 0
             || self.completion_queue_size == 0
         {
             return Err(SessionError::InvalidOptions("invalid resource limits"));
@@ -103,6 +111,7 @@ struct BudgetInner {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceUsage {
     pub sessions: usize,
+    /// Registered/reserved bytes, including completed leases after native close.
     pub registered_bytes: usize,
     pub registered_regions: usize,
     pub cleanup_failures: usize,

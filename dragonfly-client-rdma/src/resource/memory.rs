@@ -19,17 +19,18 @@
 use super::handle::{self, OwnedHandle};
 use super::Domain;
 use crate::ffi::raw::*;
-use crate::{ResourceError, SessionError};
+use crate::session::read::ReadStorage;
+use crate::{CompletedRead, ResourceError, SessionError};
 use std::ffi::c_void;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub(crate) struct RegisteredBuffer {
     inner: Option<BufferInner>,
 }
 struct BufferInner {
     mr: OwnedHandle,
-    data: Box<[u8]>,
-    _permit: crate::limits::Permit,
+    storage: Arc<ReadStorage>,
 }
 
 impl RegisteredBuffer {
@@ -72,8 +73,10 @@ impl RegisteredBuffer {
         Ok(Self {
             inner: Some(BufferInner {
                 mr,
-                data,
-                _permit: permit,
+                storage: Arc::new(ReadStorage {
+                    data,
+                    _permit: permit,
+                }),
             }),
         })
     }
@@ -84,14 +87,27 @@ impl RegisteredBuffer {
             .ok_or(ResourceError::Closed { resource: "MR" })
     }
     pub(crate) fn data(&self) -> Result<&[u8], ResourceError> {
-        Ok(&self.open()?.data)
+        Ok(&self.open()?.storage.data)
     }
     pub(crate) fn data_mut(&mut self) -> Result<&mut [u8], ResourceError> {
-        Ok(&mut self
+        let inner = self
             .inner
             .as_mut()
-            .ok_or(ResourceError::Closed { resource: "MR" })?
-            .data)
+            .ok_or(ResourceError::Closed { resource: "MR" })?;
+        let storage = Arc::get_mut(&mut inner.storage).ok_or(ResourceError::InUse {
+            resource: "leased Read buffer",
+        })?;
+        Ok(&mut storage.data)
+    }
+    pub(crate) fn is_leased(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| Arc::strong_count(&inner.storage) > 1)
+    }
+    /// Only call after the matching successful Read completion. Until every
+    /// immutable lease drops, pointer()/data_mut() reject further DMA writes.
+    pub(crate) fn completed(&self, length: usize) -> Result<CompletedRead, SessionError> {
+        CompletedRead::new(Arc::clone(&self.open()?.storage), length)
     }
     pub(crate) fn pointer(&mut self) -> Result<*mut c_void, ResourceError> {
         Ok(self.data_mut()?.as_mut_ptr().cast())
@@ -113,7 +129,13 @@ impl RegisteredBuffer {
         if let Some(inner) = self.inner.as_mut() {
             handle::try_close(&mut inner.mr)?;
         }
-        Ok(self.inner.take().map(|inner| inner.data))
+        // A completed lease may outlive native deregistration. Its storage and
+        // admission permit remain alive, but it retains no native dependency.
+        Ok(self
+            .inner
+            .take()
+            .and_then(|inner| Arc::try_unwrap(inner.storage).ok())
+            .map(|storage| storage.data))
     }
 
     pub(crate) fn try_close(&mut self) -> Result<(), ResourceError> {
@@ -133,7 +155,7 @@ impl Drop for RegisteredBuffer {
             // A live registration must never outlive its allocation. Keep both,
             // including their Domain dependency, on this exceptional path.
             if let Some(inner) = self.inner.as_ref() {
-                inner._permit.cleanup_failed();
+                inner.storage._permit.cleanup_failed();
             }
             std::mem::forget(self.inner.take());
         }
