@@ -5,6 +5,26 @@ Libfabric discovery, owned native resources and a reusable blocking transport fo
 thread. The public API accepts only the verbs provider. Discovery alone does not
 prove hardware offload, peer reachability, or application protocol compatibility.
 
+## Current status
+
+The transport uses libfabric `fi_send` / `fi_recv` for application control messages
+and one-sided RDMA Read (`fi_read`) for payloads. It is a standalone transport;
+Dragonfly piece serving/downloading, peer capability announcements, automatic
+selection, and piece-level TCP fallback are not yet integrated. Its diagnostic
+messages do not implement the Vortex protocol or establish Vortex wire compatibility.
+
+Functional testing has been reported on **Mac ARM64 + UTM + Ubuntu 24.04 ARM64 +
+Soft-RoCE (RXE)**. This includes a single-VM two-process test with 16 consecutive
+4 MiB reads (64 MiB total), data verification, connection rotation and resource
+cleanup, plus a separate cross-VM RDMA transfer test. Physical RoCE/InfiniBand NIC
+validation and TCP/RDMA performance comparisons remain pending.
+
+See [Validation record](VALIDATION.md) for the reported test scope, evidence still
+to archive, and remaining acceptance work. The
+[design coordination comment](https://github.com/dragonflyoss/client/issues/1926#issuecomment-6948343423)
+asks maintainers to confirm Vortex adaptation, capability discovery and RFC
+coordination; it is not a record of design approval.
+
 ## Build and probe
 
 Default builds need no libfabric installation. Linux without the `rdma` feature
@@ -269,6 +289,12 @@ attempt in Dragonfly, not inside the native transport.
 Use two Linux hosts with compatible working verbs interfaces. Configure the
 RoCEv2/InfiniBand link, routing and firewall first. Probe each host's local domain;
 the domain names may differ. Use RDMA addresses rather than management addresses.
+For functional testing, the two processes can also run in one Linux VM or in two
+VMs with working RXE interfaces. Run the native examples inside Linux; the macOS
+host itself does not enable the Linux native path. The `mlx5_0` / `mlx5_1` domains
+below are hardware examples: replace them with each test host's actual libfabric
+domain, including its RXE domain when using Soft-RoCE. IP connectivity alone does
+not verify an RDMA transfer.
 
 Host A:
 
@@ -344,6 +370,13 @@ pool byte limit; iterations are bounded to 1..=65,536. Copy/borrow use one activ
 Read. The default 120-second timeout covers the full benchmark request; increase
 `--timeout-secs` on both hosts for longer runs (up to 600 seconds).
 
+These are API microbenchmark combinations. The project acceptance comparison uses
+64 KiB/1 MiB/4 MiB/16 MiB pieces and 1/8/32 concurrent business requests, with at
+least three runs per TCP/RDMA combination. A Read window is not business-request
+concurrency, and 256 KiB does not replace the 16 MiB acceptance case. See the
+[remaining validation work](VALIDATION.md#remaining-validation-and-acceptance)
+for the end-to-end comparison and memory-budget constraints.
+
 ## Tests and integration boundary
 
 ```bash
@@ -351,6 +384,11 @@ cargo test --locked -p dragonfly-client-rdma --all-targets
 cargo test --locked -p dragonfly-client-rdma --all-features --all-targets
 cargo clippy --locked -p dragonfly-client-rdma --all-targets --all-features -- -D warnings
 ```
+
+On macOS, `--all-features` still excludes the Linux C/FFI and native session paths.
+The commands above describe checks to run; they are not an execution record. Keep
+portable test results, Linux software-provider tests, RXE diagnostics and physical
+hardware results separate in the [validation record](VALIDATION.md).
 
 Linux feature tests use real libfabric with its software TCP provider. They cover
 repeated reads, reusable registrations, byte correctness, request cancellation,
