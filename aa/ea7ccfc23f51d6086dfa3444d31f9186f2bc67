@@ -1,0 +1,22 @@
+dragonfly-client-rdma/README.md
+  s_7ee19e9d98ae0c::t_80f60d679225b5 8-27,292-297,373-379,388-391
+  s_7ee19e9d98ae0c::t_a9a5638abd4959 392
+dragonfly-client-rdma/VALIDATION.md
+  s_7ee19e9d98ae0c::t_80f60d679225b5 1-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aaea7ccfc23f51d6086dfa3444d31f9186f2bc67",
+  "prompts": {},
+  "sessions": {
+    "s_7ee19e9d98ae0c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e96f-bbbb-75d3-a3bb-52893702ce6f",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "ztygod <2739022972@qq.com>"
+    }
+  }
+}
